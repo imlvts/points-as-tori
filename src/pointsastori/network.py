@@ -303,20 +303,28 @@ def torus_precompute_masked(
 		kappa_max = jnp.where(use_pos_as_min, kappa_neg, kappa_pos)
 		v_min = jnp.where(use_pos_as_min, v_pos, v_neg)
 
-		abs_kappa_max = jnp.maximum(jnp.abs(kappa_max), NAN_EPSILON)
-		abs_kappa_min = jnp.maximum(jnp.abs(kappa_min), NAN_EPSILON)
+		# Geometric sign rule (the osculating torus at every point, saddles included). With the curvatures floored to
+		# +-NAN_EPSILON keeping their sign (+NAN_EPSILON at exactly 0) and the signed radii of curvature
+		# rho_min = 1/kappa_min, rho_max = 1/kappa_max, the torus center is the center of the parallel circle,
+		# Q*(0,0) + rho_min n*, the tube center is Q*(0,0) + rho_max n*, R = |rho_min - rho_max| and the stored minor
+		# radius is -rho_max = s r with s = -sgn(kappa_max) (the SDF sign of Eq. 22 is unchanged). The previous rule
+		# took the center side from Eq. 22's s, i.e. from kappa_max: at saddles (kappa_min kappa_max < 0) that is the
+		# mirror image of the osculating torus, with inside and outside swapped at the point (dg/dn* = -1). Both rules
+		# give bit-identical tori wherever kappa_min kappa_max > 0.
+		kappa_min_f = jnp.where(jnp.abs(kappa_min) >= NAN_EPSILON, kappa_min, jnp.where(kappa_min < 0, -NAN_EPSILON, NAN_EPSILON))
+		kappa_max_f = jnp.where(jnp.abs(kappa_max) >= NAN_EPSILON, kappa_max, jnp.where(kappa_max < 0, -NAN_EPSILON, NAN_EPSILON))
+		rho_min = 1.0 / kappa_min_f
 
 		# Compute torus parameters
-		r = 1.0 / abs_kappa_max
-		R = 1.0 / abs_kappa_min - jnp.sign(kappa_max * kappa_min) * r
-		# s_R = jax.lax.cond(R >= 0, lambda: 1.0, lambda: -1.0)
-		# major_radius = s_R * jnp.maximum(jnp.abs(R), NAN_EPSILON)
+		r = 1.0 / jnp.abs(kappa_max_f)
+		# R = |rho_min - rho_max|, written with a constant sign so that R keeps its gradient where R = 0 (umbilics)
+		R = jax.lax.stop_gradient(jnp.sign(kappa_min_f)) * (rho_min - 1.0 / kappa_max_f)
 
-		# Sign convention from C++
-		s = jnp.where(((kappa_max < 0) & (kappa_min < 0)) | ((kappa_max < 0) & (kappa_min > 0)), 1.0, -1.0)
+		# Tube sign s = -sgn(kappa_max): the tube is the inside iff its center lies on the inner side
+		s = jnp.where(kappa_max_f < 0, 1.0, -1.0)
 
 		# Torus center
-		center = p_i + a00 * n_i - (s / abs_kappa_min) * normal
+		center = p_i + a00 * n_i + rho_min * normal
 
 		# Torus axis (u = normal × v_min, normalized)
 		u = jnp.cross(normal, v_min)

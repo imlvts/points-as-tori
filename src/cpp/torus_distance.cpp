@@ -794,16 +794,23 @@ TorusDistanceField::fit_torus_at_point(int i, const Eigen::Matrix<double, 6, 1>&
     Eigen::Vector3d v_min = std::get<3>(result);
     Eigen::Vector3d normal = std::get<4>(result);
 
-    double r = 1. / std::abs(kappa_max);
-    double R = 1. / std::abs(kappa_min) - sgn(kappa_max * kappa_min) * r;
-    double s = ((kappa_max < 0. && kappa_min < 0.) || (kappa_max < 0 && kappa_min > 0.)) ? 1. : -1.;
+    // Geometric sign rule, as in the training fit (network.py, torus_precompute_masked): curvatures floored to
+    // +-NAN_EPSILON keeping their sign (+NAN_EPSILON at exactly 0); with the signed radii of curvature rho = 1/kappa the
+    // torus center is p* + rho_min n*, R = |rho_min - rho_max| and the stored minor radius is -rho_max (= s r with
+    // s = -sgn(kappa_max)). The previous rule took the center side from the sign of kappa_max, which at saddles gives
+    // the mirror image of the osculating torus (inside and outside swapped at the point). Identical (bit for bit)
+    // wherever kappa_min kappa_max > 0.
+    auto floored = [&](double k) { return std::abs(k) >= NAN_EPSILON ? k : (k < 0. ? -NAN_EPSILON : NAN_EPSILON); };
+    double rho_min = 1. / floored(kappa_min);
+    double rho_max = 1. / floored(kappa_max);
+    double R = std::abs(rho_min - rho_max);
 
-    Eigen::Vector3d center = p_i + a00 * n_i - s / std::abs(kappa_min) * normal;
+    Eigen::Vector3d center = p_i + a00 * n_i + rho_min * normal;
     Eigen::Vector3d u = normal.cross(v_min);
     u /= std::max(u.norm(), NAN_EPSILON); // reproduce Python results
     Eigen::Vector2d axis = cartesian_to_rotation(u);
 
-    return {center, axis, R, s * r};
+    return {center, axis, R, -rho_max};
 }
 
 void TorusDistanceField::fit_tori_from_forms(const Eigen::Matrix<double, 6, Eigen::Dynamic>& coefficients) {
