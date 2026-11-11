@@ -492,7 +492,15 @@ def torus_distance_gradient_masked(
 	# Exponential weight
 	lam_expanded = lam[:, :, None]  # (batch, n_queries, 1)
 	shift_expanded = shifts[:, :, None]  # (batch, n_queries, 1)
-	weight = jnp.exp(-lam_expanded * (dist_to_point - shift_expanded))  # (batch, n_queries, max_points)
+	# Log-sum-exp (soft-min) form of the Eq. 25 blend: the exponents are shifted by their per-query maximum over the
+	# valid points (a constant, hence stop_gradient), so the largest weight is 1 and sum(weight) >= 1. The blend
+	# sum(w g) / sum(w) is unchanged, but the NAN_EPSILON guard below can no longer fire. Before, the shift/lambda came
+	# from the 64-NN of the query while the sum ran over all points, so for queries beyond ~0.9x the 64-NN radius every
+	# weight underflowed, sum(w) < 1e-10, and the guard returned phi ~ 0 with a meaningless gradient there.
+	exponent = -lam_expanded * (dist_to_point - shift_expanded)  # (batch, n_queries, max_points)
+	exponent_max = jnp.max(jnp.where(mask_i, exponent, -jnp.inf), axis=-1, keepdims=True)  # (batch, n_queries, 1)
+	exponent_max = jax.lax.stop_gradient(jnp.where(jnp.isfinite(exponent_max), exponent_max, 0.0))
+	weight = jnp.exp(exponent - exponent_max)  # (batch, n_queries, max_points)
 
 	# Apply mask to weights
 	weight = jnp.where(mask_i, weight, 0.0)
