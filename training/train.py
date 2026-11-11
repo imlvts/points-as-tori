@@ -6,6 +6,12 @@ from mesh_data import *
 from mesh_sampling_jax import *
 
 
+def sanitize_neighbors(neighbors):
+	"""Replace the -1 entries of a (..., max_points, k) neighbor array by the index of their own row."""
+	rows = np.arange(neighbors.shape[-2], dtype=neighbors.dtype)[:, None]
+	return np.where(neighbors < 0, rows, neighbors)
+
+
 def load_mesh_training_data(filepath):
 	"""
 	Load training data with mesh information from NPZ file.
@@ -32,6 +38,10 @@ def load_mesh_training_data(filepath):
 	all_mesh_vertices = data['mesh_vertices']
 	all_mesh_faces = data['mesh_faces']
 	all_face_masks = data['face_masks']
+
+	# Padded rows (and the missing neighbors of shapes with fewer than k points) are stored as -1, which would gather
+	# the last, zero-padded point. Point them at the row itself instead.
+	all_neighbors = sanitize_neighbors(all_neighbors)
 
 	print(f'Loaded mesh training data from {filepath}')
 	print(f'  Shapes: {len(all_positions)} shapes')
@@ -513,6 +523,11 @@ def TrainFundamentalFormPredictor(
 				batch_queries = jax.lax.dynamic_slice_in_dim(shape_queries, start_idx, batch_size)
 				batch_distances = jax.lax.dynamic_slice_in_dim(shape_distances, start_idx, batch_size)
 
+				# A batch of padded rows only has no loss; an optimizer step on it would still move the weights
+				# (Adam momentum with a zero gradient). Skip it.
+				if not np.any(all_masks[shape_idx, start_idx : start_idx + batch_size]):
+					continue
+
 				# Train step
 				loss, loss_dict = train_step(
 					model,
@@ -534,7 +549,7 @@ def TrainFundamentalFormPredictor(
 			epoch_losses.extend(batch_losses_list)
 			epoch_distance_losses.extend(batch_distance_losses_list)
 			epoch_eikonality_losses.extend(batch_eikonality_losses_list)
-			total_num_batches += n_batches
+			total_num_batches += len(batch_losses_list)
 
 			# Clean up GPU memory for this shape
 			del positions, normals, neighbors, mask

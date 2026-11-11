@@ -205,6 +205,15 @@ def torus_precompute_masked(
 
 	max_points = points.shape[0]
 
+	# Masked (padded) rows get a fixed, well-conditioned dummy input (unit normal, the network's initial sphere
+	# coefficients) before the fit. The where passes no cotangent to the masked rows, so a degenerate fit there (zero
+	# normals, arbitrary coefficients) can neither produce NaN values nor NaN gradients; the blend drops these tori
+	# through its mask as before.
+	row_mask = mask[:, None]
+	points = jnp.where(row_mask, points, 0.0)
+	normals = jnp.where(row_mask, normals, jnp.array([0.0, 0.0, 1.0], dtype=normals.dtype))
+	coeffs = jnp.where(row_mask, coeffs, jnp.array([0.0, 0.0, 0.0, 0.0, -0.5, -0.5], dtype=coeffs.dtype))
+
 	# Fit torus at a single point.
 	@jit
 	def solve_single(i):
@@ -1019,6 +1028,10 @@ class InputFeatures(nnx.Module):
 		diff_vectors = positions - positions[:, 0:1, :]  # [batch, k, 3]
 		distances = jnp.sqrt(jnp.sum(diff_vectors * diff_vectors, axis=-1))  # [batch, k]
 		median = jnp.median(distances, axis=-1)  # [batch, ]
+		# A neighborhood whose points mostly coincide (the padded rows of a padded shape) has median 0, and 0/0 gives NaN
+		# features. Even when such rows are masked out of the loss, NaN activations turn the (zero) cotangent of every
+		# shared weight into NaN, i.e. the whole gradient of the step. Use scale 1 there instead.
+		median = jnp.where(median > 0, median, 1.0)
 		normalized_positions = positions / median[:, None, None]  # [batch, k, 3]
 
 		# The following block of code is copied from local_coordinates() above, because we also need the orthonormal basis.
