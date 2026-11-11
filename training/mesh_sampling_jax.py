@@ -523,10 +523,88 @@ def sample_narrow_band_single_bbox(
 	return samples
 
 
+def _pick_accepted(accepted: jax.Array, key: jax.random.PRNGKey, n: int) -> Tuple[jax.Array, jax.Array]:
+	"""n indices of accepted entries in random order (cycling if there are fewer than n), and the number accepted."""
+	r = jax.random.uniform(key, accepted.shape)
+	order = jnp.argsort(jnp.where(accepted, r, 2.0 + r))
+	n_accepted = jnp.sum(accepted)
+	return order[jnp.arange(n) % jnp.maximum(n_accepted, 1)], n_accepted
+
+
+@partial(jit, static_argnames=['n', 'n_candidates'])
+def sample_zero_set_and_band_local(
+	bbox_min: jax.Array,  # (3,) regularized neighborhood box
+	bbox_max: jax.Array,  # (3,)
+	cube_min: jax.Array,  # (3,) extended cube (the cube-class box)
+	cube_max: jax.Array,  # (3,)
+	neighborhood_points: jax.Array,  # (k, 3)
+	vertices: jax.Array,  # (max_vertices, 3)
+	faces: jax.Array,  # (max_faces, 3)
+	face_normals: jax.Array,  # (max_faces, 3)
+	face_areas: jax.Array,  # (max_faces,)
+	face_mask: jax.Array,  # (max_faces,)
+	offset: float,
+	n: int,
+	key: jax.random.PRNGKey,
+	n_candidates: int = 4096,
+) -> Tuple[jax.Array, jax.Array]:
+	"""
+	Zero-set and narrow-band samples that stay inside the neighborhood.
+
+	Candidates are drawn area-uniformly on the valid faces whose bounding box meets the regularized box (the same
+	candidate faces as before), and a zero-set candidate is kept only if it lies inside that box: rejection sampling,
+	i.e. uniform samples of (mesh ∩ box). Sampling the whole intersecting faces instead put most zero-set and band
+	queries of CAD meshes with large faces far outside the neighborhood. Band samples are kept zero-set candidates
+	offset by U(-offset, offset) along the face normal, kept only if inside the cube box.
+
+	If fewer than n candidates are accepted, accepted ones are reused; if none are (degenerate box), the neighborhood
+	points themselves (which lie on the surface) are used.
+
+	Returns:
+		zero_samples: (n, 3)
+		band_samples: (n, 3)
+	"""
+	safe_faces = jnp.maximum(faces, 0)
+	v0 = vertices[safe_faces[:, 0]]
+	v1 = vertices[safe_faces[:, 1]]
+	v2 = vertices[safe_faces[:, 2]]
+
+	tri_bbox_min = jnp.minimum(jnp.minimum(v0, v1), v2)
+	tri_bbox_max = jnp.maximum(jnp.maximum(v0, v1), v2)
+	intersects = jnp.all(tri_bbox_min <= bbox_max, axis=-1) & jnp.all(tri_bbox_max >= bbox_min, axis=-1)
+	weights = jnp.where(face_mask & intersects, face_areas, 0.0)
+	total_weight = jnp.sum(weights)
+
+	key_face, key_u, key_v, key_zero, key_offset, key_band = jax.random.split(key, 6)
+	face_indices = jax.random.choice(
+		key_face, faces.shape[0], shape=(n_candidates,), p=weights / jnp.maximum(total_weight, EPS)
+	)
+	u = jax.random.uniform(key_u, (n_candidates,))
+	v = jax.random.uniform(key_v, (n_candidates,))
+	sqrt_u = jnp.sqrt(u)
+	alpha = sqrt_u * (1.0 - v)
+	beta = v * sqrt_u
+	gamma = 1.0 - alpha - beta
+	candidates = alpha[:, None] * v0[face_indices] + beta[:, None] * v1[face_indices] + gamma[:, None] * v2[face_indices]
+
+	in_box = jnp.all((candidates >= bbox_min) & (candidates <= bbox_max), axis=-1) & (total_weight > 0)
+	offsets = jax.random.uniform(key_offset, (n_candidates,), minval=-offset, maxval=offset)
+	band = candidates + offsets[:, None] * face_normals[face_indices]
+	in_cube = in_box & jnp.all((band >= cube_min) & (band <= cube_max), axis=-1)
+
+	zero_idx, n_zero = _pick_accepted(in_box, key_zero, n)
+	band_idx, n_band = _pick_accepted(in_cube, key_band, n)
+	fallback = neighborhood_points[jnp.arange(n) % neighborhood_points.shape[0]]
+	zero_samples = jnp.where(n_zero > 0, candidates[zero_idx], fallback)
+	band_samples = jnp.where(n_band > 0, band[band_idx], fallback)
+	return zero_samples, band_samples
+
+
 @partial(jit, static_argnames=['n_queries', 'n_queries_per_type'])
 def generate_queries_for_neighborhood(
 	bbox_min: jax.Array,  # (3,)
 	bbox_max: jax.Array,  # (3,)
+	neighborhood_points: jax.Array,  # (k, 3)
 	vertices: jax.Array,  # (max_vertices, 3)
 	faces: jax.Array,  # (max_faces, 3)
 	face_normals: jax.Array,  # (max_faces, 3)
@@ -542,12 +620,14 @@ def generate_queries_for_neighborhood(
 	Generate query points for a single neighborhood.
 
 	Samples:
-	- n_queries_per_type from zero set
-	- n_queries_per_type from narrow band
-	- n_queries_per_type from extended bbox
+	- n_queries_per_type from the zero set inside the (regularized) neighborhood box
+	- n_queries_per_type from the narrow band, inside the extended cube
+	- n_queries_per_type from the extended cube
+	(see sample_zero_set_and_band_local)
 
 	Args:
 		bbox_min, bbox_max: Neighborhood bounding box
+		neighborhood_points: The neighborhood's points (fallback samples for degenerate boxes)
 		vertices, faces: Mesh geometry
 		face_normals, face_areas: Pre-computed face properties
 		face_mask: Valid face mask
@@ -571,15 +651,20 @@ def generate_queries_for_neighborhood(
 	# Split key
 	key, key_zero, key_narrow, key_bbox = jax.random.split(key, 4)
 
-	# Zero set samples
-	zero_samples = sample_zero_set_single_bbox(
-		bbox_min_reg, bbox_max_reg, vertices, faces, face_normals, face_areas, face_mask, n_queries_per_type, key_zero
-	)
+	# Extended bbox (cube based on max extent): the cube class, and the box the band samples must stay in
+	sidelength = jnp.maximum(jnp.max(jnp.abs(bbox_diag)), 0.01)
+	radius = 0.5 * jnp.sqrt(3.0) * sidelength
+	diag = jnp.ones(3)
+	bbox_min_ext = bbox_center - radius * diag * bbox_extension
+	bbox_max_ext = bbox_center + radius * diag * bbox_extension
 
-	# Narrow band samples
-	narrow_samples = sample_narrow_band_single_bbox(
+	# Zero set and narrow band samples
+	zero_samples, narrow_samples = sample_zero_set_and_band_local(
 		bbox_min_reg,
 		bbox_max_reg,
+		bbox_min_ext,
+		bbox_max_ext,
+		neighborhood_points,
 		vertices,
 		faces,
 		face_normals,
@@ -587,16 +672,8 @@ def generate_queries_for_neighborhood(
 		face_mask,
 		narrow_band_offset,
 		n_queries_per_type,
-		key_narrow,
+		key_zero,
 	)
-
-	# Extended bbox samples
-	# Compute extended bbox (cube based on max extent)
-	sidelength = jnp.maximum(jnp.max(jnp.abs(bbox_diag)), 0.01)
-	radius = 0.5 * jnp.sqrt(3.0) * sidelength
-	diag = jnp.ones(3)
-	bbox_min_ext = bbox_center - radius * diag * bbox_extension
-	bbox_max_ext = bbox_center + radius * diag * bbox_extension
 
 	bbox_samples = sample_bbox_uniform(bbox_min_ext, bbox_max_ext, n_queries_per_type, key_bbox)
 
@@ -656,6 +733,7 @@ def generate_shape_features(
 		return generate_queries_for_neighborhood(
 			bbox_mins[i],
 			bbox_maxs[i],
+			neighbor_positions[i],
 			vertices,
 			faces,
 			face_normals,
