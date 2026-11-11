@@ -1,3 +1,5 @@
+import argparse
+
 import matplotlib.pyplot as plt
 
 from pointsastori.shape_3d import *
@@ -298,10 +300,20 @@ def TrainFundamentalFormPredictor(
 	n_shapes_to_save,
 	load_model_path=None,
 	final_save_filepath=None,
+	seed=42,
+	models_dir=MODELS_DIR,
+	validation_file='datasets/ABC17_validation_3.npz',
+	max_steps=0,
+	log_every=0,
 ):
 	"""
 	Args:
 		load_model_path: Optional path to a saved model file (.pkl) to use as warm start
+		seed: seed of the network initialization, the shape order and the query sampling
+		models_dir: directory of the saved models
+		validation_file: validation data (skipped if the file does not exist)
+		max_steps: stop after this many optimizer steps (0: run all epochs)
+		log_every: print the mean loss of the last log_every steps (0: off)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -309,7 +321,6 @@ def TrainFundamentalFormPredictor(
 	print(jax.default_backend())
 	print(jax.devices())
 
-	seed = 42
 	key = jax.random.PRNGKey(seed)
 	rngs = nnx.Rngs(seed)
 
@@ -401,7 +412,7 @@ def TrainFundamentalFormPredictor(
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
-	val_data_filename = 'datasets/ABC17_validation_3.npz'
+	val_data_filename = validation_file
 	val_positions = None
 	val_normals = None
 	val_neighbors = None
@@ -444,11 +455,83 @@ def TrainFundamentalFormPredictor(
 		}
 
 		model_name = f'FundamentalFormPredictor_{epoch}' if save_filepath is None else save_filepath
-		filepath = MODELS_DIR + model_name + '.pkl'
+		os.makedirs(models_dir, exist_ok=True)
+		filepath = os.path.join(models_dir, model_name + '.pkl')
 		with open(filepath, 'wb') as f:
 			pickle.dump(saved_data, f)
 
 		print(f'Model saved to {filepath}')
+
+	def run_validation(epoch_key):
+		"""Validation loss (distance, eikonality) of the current model; queries from fold_in(epoch_key, 10000 + i)."""
+		nnx.eval_mode(model)
+		n_val_shapes = len(val_positions)
+		val_shape_losses = []
+		val_shape_eikonality_losses = []
+
+		for val_shape_idx in range(n_val_shapes):
+			# Generate validation key (deterministic per epoch)
+			val_key = jax.random.fold_in(epoch_key, 10000 + val_shape_idx)
+
+			val_pos = val_positions[val_shape_idx]
+			val_norm = val_normals[val_shape_idx]
+			val_neigh = val_neighbors[val_shape_idx]
+			val_mask = val_masks[val_shape_idx]
+			val_verts = val_mesh_vertices[val_shape_idx]
+			val_faces = val_mesh_faces[val_shape_idx]
+			val_fmask = val_face_masks[val_shape_idx]
+
+			# Generate validation queries on-the-fly
+			val_queries, val_distances = generate_shape_features(
+				val_pos,
+				val_neigh,
+				val_verts,
+				val_faces,
+				val_fmask,
+				val_key,
+				n_queries=n_queries_per_neighborhood,
+			)
+
+			# Compute weights for this validation shape
+			val_weights = model(val_pos[val_neigh], val_norm[val_neigh])
+
+			# Compute loss per batch
+			n_val_batches = (val_pos.shape[0] + batch_size - 1) // batch_size
+			batch_val_losses = []
+			batch_val_eikonality_losses = []
+
+			for batch_idx in range(n_val_batches):
+				start_idx = batch_idx * batch_size
+				batch_mask = jax.lax.dynamic_slice_in_dim(val_mask, start_idx, batch_size)
+				batch_queries = jax.lax.dynamic_slice_in_dim(val_queries, start_idx, batch_size)
+				batch_distances = jax.lax.dynamic_slice_in_dim(val_distances, start_idx, batch_size)
+
+				# Only compute if batch has valid points
+				if jnp.sum(batch_mask) > 0:
+					val_loss, val_eikonality_loss = validation_loss(
+						val_mask,
+						batch_mask,
+						val_pos,
+						val_norm,
+						val_weights,
+						batch_queries,
+						batch_distances,
+					)
+					batch_val_losses.append(val_loss)
+					batch_val_eikonality_losses.append(val_eikonality_loss)
+
+			# Average over batches for this shape
+			if len(batch_val_losses) > 0:
+				val_shape_losses.append(np.mean(batch_val_losses))
+				val_shape_eikonality_losses.append(np.mean(batch_val_eikonality_losses))
+
+		# Average over all validation shapes
+		val_loss = np.mean(val_shape_losses) if len(val_shape_losses) > 0 else 0.0
+		val_eikonality_loss = (
+			np.mean(val_shape_eikonality_losses) if len(val_shape_eikonality_losses) > 0 else 0.0
+		)
+		nnx.train_mode(model)
+		return val_loss, val_eikonality_loss
 
 	# Training loop
 	nnx.train_mode(model)
@@ -466,6 +549,11 @@ def TrainFundamentalFormPredictor(
 
 	num_training_datasets = len(all_training_data)
 	np.random.seed(seed)
+
+	step = 0  # optimizer steps in this phase
+	log_buffer = []
+	t_log = time.time()
+	stop = False
 
 	for epoch in range(num_epochs):
 		epoch_key = jax.random.fold_in(key, epoch)  # deterministic key per epoch
@@ -556,6 +644,23 @@ def TrainFundamentalFormPredictor(
 				batch_distance_losses_list.append(loss_dict['distance_loss'])
 				batch_eikonality_losses_list.append(loss_dict['eikonality_loss'])
 
+				step += 1
+				if log_every:
+					log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss']))
+					if step % log_every == 0:
+						v = np.array([[float(x) for x in r] for r in log_buffer])
+						log_buffer = []
+						now = time.time()
+						print(
+							f'[step] {step} loss {v[:, 0].mean():.8f} distance {v[:, 1].mean():.8f} '
+							f'eikonality {v[:, 2].mean():.8f} {(now - t_log) / log_every:.3f} s/step',
+							flush=True,
+						)
+						t_log = now
+				if max_steps and step >= max_steps:
+					stop = True
+					break
+
 			# Accumulate losses for this shape
 			epoch_losses.extend(batch_losses_list)
 			epoch_distance_losses.extend(batch_distance_losses_list)
@@ -577,6 +682,9 @@ def TrainFundamentalFormPredictor(
 					f'distance = {epoch_distance_loss:.6f}  '
 					f'eikonality = {epoch_eikonality_loss:.6f}'
 				)
+
+			if stop:
+				break
 
 		# Compute epoch averages
 		epoch_train_loss = np.sum(epoch_losses) / total_num_batches
@@ -600,73 +708,7 @@ def TrainFundamentalFormPredictor(
 
 			# Validation loss
 			if val_positions is not None:
-				nnx.eval_mode(model)
-				n_val_shapes = len(val_positions)
-				val_shape_losses = []
-				val_shape_eikonality_losses = []
-
-				for val_shape_idx in range(n_val_shapes):
-					# Generate validation key (deterministic per epoch)
-					val_key = jax.random.fold_in(epoch_key, 10000 + val_shape_idx)
-
-					val_pos = val_positions[val_shape_idx]
-					val_norm = val_normals[val_shape_idx]
-					val_neigh = val_neighbors[val_shape_idx]
-					val_mask = val_masks[val_shape_idx]
-					val_verts = val_mesh_vertices[val_shape_idx]
-					val_faces = val_mesh_faces[val_shape_idx]
-					val_fmask = val_face_masks[val_shape_idx]
-
-					# Generate validation queries on-the-fly
-					val_queries, val_distances = generate_shape_features(
-						val_pos,
-						val_neigh,
-						val_verts,
-						val_faces,
-						val_fmask,
-						val_key,
-						n_queries=n_queries_per_neighborhood,
-					)
-
-					# Compute weights for this validation shape
-					val_weights = model(val_pos[val_neigh], val_norm[val_neigh])
-
-					# Compute loss per batch
-					n_val_batches = (val_pos.shape[0] + batch_size - 1) // batch_size
-					batch_val_losses = []
-					batch_val_eikonality_losses = []
-
-					for batch_idx in range(n_val_batches):
-						start_idx = batch_idx * batch_size
-						batch_mask = jax.lax.dynamic_slice_in_dim(val_mask, start_idx, batch_size)
-						batch_queries = jax.lax.dynamic_slice_in_dim(val_queries, start_idx, batch_size)
-						batch_distances = jax.lax.dynamic_slice_in_dim(val_distances, start_idx, batch_size)
-
-						# Only compute if batch has valid points
-						if jnp.sum(batch_mask) > 0:
-							val_loss, val_eikonality_loss = validation_loss(
-								val_mask,
-								batch_mask,
-								val_pos,
-								val_norm,
-								val_weights,
-								batch_queries,
-								batch_distances,
-							)
-							batch_val_losses.append(val_loss)
-							batch_val_eikonality_losses.append(val_eikonality_loss)
-
-					# Average over batches for this shape
-					if len(batch_val_losses) > 0:
-						val_shape_losses.append(np.mean(batch_val_losses))
-						val_shape_eikonality_losses.append(np.mean(batch_val_eikonality_losses))
-
-				# Average over all validation shapes
-				val_loss = np.mean(val_shape_losses) if len(val_shape_losses) > 0 else 0.0
-				val_eikonality_loss = (
-					np.mean(val_shape_eikonality_losses) if len(val_shape_eikonality_losses) > 0 else 0.0
-				)
-				nnx.train_mode(model)
+				val_loss, val_eikonality_loss = run_validation(epoch_key)
 
 				validation_losses.append(val_loss)
 				validation_epochs.append(epoch)
@@ -675,6 +717,9 @@ def TrainFundamentalFormPredictor(
 					f'	{"validation:":<{LABEL_WIDTH}}{val_loss:<{VALUE_WIDTH}.6f}'
 					f'{"eikonality:":<{LABEL_WIDTH}}{val_eikonality_loss:<{VALUE_WIDTH}.6f}'
 				)
+
+		if stop:
+			break
 
 	t1 = time.time()
 	print(f'Total training time: {t1 - t0:.2f} s')
@@ -728,105 +773,149 @@ def TrainFundamentalFormPredictor(
 	print('Training history plot saved to PlotTrainingHistory.png')
 
 
-def train():
-	dataset_dir = 'datasets/nice'
+def authors_curriculum(data_dir='datasets', models_dir=MODELS_DIR):
+	"""
+	The training curriculum of the paper (Sec. 4.3; plus the pretraining on a single blob), as a list of phases.
+	Each phase is a dict of TrainFundamentalFormPredictor arguments plus its 'name'; a phase starts from the model saved
+	by the previous one.
+	"""
+	dataset_dir = os.path.join(data_dir, 'nice')
+	simulated_dir = os.path.join(data_dir, 'simulated')
+	nice = lambda pattern: glob.glob(os.path.join(dataset_dir, pattern))  # noqa: E731
+	saved = lambda name: os.path.join(models_dir, name + '.pkl')  # noqa: E731
 
-	# Pretraining
-	training_data_filenames = ['datasets/pretraining_blob.npz']
-	TrainFundamentalFormPredictor(
-		training_data_filenames,
-		num_epochs=64,
-		learning_rate=1e-3,
-		warmup_steps=0,
-		batch_size=32,
-		n_epochs_to_save=1,
-		n_shapes_to_save=1,
-		load_model_path=None,
-		final_save_filepath='FundamentalFormPredictor_pretrained',
+	# Phase 1 interleaves the blob and ABC lists
+	phase1_files = [val for tup in zip(nice('blobs_train_mode0*.npz'), nice('ABC17_train_mode0_*.npz')) for val in tup]
+
+	return [
+		# Pretraining
+		dict(
+			name='pretrain',
+			training_data_filenames=[os.path.join(data_dir, 'pretraining_blob.npz')],
+			num_epochs=64,
+			learning_rate=1e-3,
+			warmup_steps=0,
+			batch_size=32,
+			n_epochs_to_save=1,
+			n_shapes_to_save=1,
+			load_model_path=None,
+			final_save_filepath='FundamentalFormPredictor_pretrained',
+		),
+		# Phase 0: nicely sampled blobs
+		dict(
+			name='phase0',
+			training_data_filenames=sorted(nice('blobs_train_mode0*.npz')),
+			num_epochs=24,
+			learning_rate=1e-5,
+			warmup_steps=1e2,
+			batch_size=1024,
+			n_epochs_to_save=1,
+			n_shapes_to_save=1,
+			load_model_path=saved('FundamentalFormPredictor_pretrained'),
+			final_save_filepath='FundamentalFormPredictor_phase0',
+		),
+		# Phase 1: nicely sampled blobs and ABC meshes
+		dict(
+			name='phase1',
+			training_data_filenames=phase1_files,
+			num_epochs=8,
+			learning_rate=1e-5,
+			warmup_steps=1e3,
+			batch_size=1024,
+			n_epochs_to_save=1,
+			n_shapes_to_save=100,
+			load_model_path=saved('FundamentalFormPredictor_phase0'),
+			final_save_filepath='FundamentalFormPredictor_phase1',
+		),
+		# Phase 2: nicely sampled blobs and more ABC meshes
+		dict(
+			name='phase2',
+			training_data_filenames=nice('blobs_train_mode0*.npz') + nice('ABC17_train_mode0_*.npz') + nice('ABC2_train_mode0_*.npz'),
+			num_epochs=8,
+			learning_rate=1e-6,
+			warmup_steps=1e3,
+			batch_size=1024,
+			n_epochs_to_save=1,
+			n_shapes_to_save=100,
+			load_model_path=saved('FundamentalFormPredictor_phase1'),
+			final_save_filepath='FundamentalFormPredictor_phase2',
+		),
+		# Phase 3: nicely sampled blobs and even more ABC meshes
+		dict(
+			name='phase3',
+			training_data_filenames=nice('blobs_train_mode0*.npz') + nice('ABC*_train_mode0_*.npz'),
+			num_epochs=5,
+			learning_rate=1e-6,
+			warmup_steps=1e3,
+			batch_size=1024,
+			n_epochs_to_save=1,
+			n_shapes_to_save=100,
+			load_model_path=saved('FundamentalFormPredictor_phase2'),
+			final_save_filepath='FundamentalFormPredictor_phase3',
+		),
+		# Phase 4: everything from before, plus unevenly sampled data possibly with small gaps from a simulated scanning process
+		dict(
+			name='phase4',
+			training_data_filenames=nice('blobs_train_mode0*.npz')
+			+ nice('ABC*_train_mode0_*.npz')
+			+ glob.glob(os.path.join(simulated_dir, 'blobs_train_mode*.npz'))
+			+ glob.glob(os.path.join(simulated_dir, 'ABC*_train_mode*.npz')),
+			num_epochs=2,
+			learning_rate=1e-7,
+			warmup_steps=1e3,
+			batch_size=1024,
+			n_epochs_to_save=1,
+			n_shapes_to_save=100,
+			load_model_path=saved('FundamentalFormPredictor_phase3'),
+			final_save_filepath='FundamentalFormPredictor_phase4',
+		),
+	]
+
+
+def train(data_dir='datasets', models_dir=MODELS_DIR, only_phases=None, **options):
+	"""
+	Run the curriculum. only_phases: names of the phases to run (None: all); options: further keyword arguments of
+	TrainFundamentalFormPredictor, the same for every phase.
+	"""
+	for phase in authors_curriculum(data_dir, models_dir):
+		name = phase.pop('name')
+		if only_phases and name not in only_phases:
+			continue
+		print(f'\n===== {name} =====', flush=True)
+		TrainFundamentalFormPredictor(**phase, models_dir=models_dir, **options)
+
+
+def parse_args(argv=None):
+	ap = argparse.ArgumentParser(
+		description='Train the Points-as-Tori fundamental-form predictor. With no options this runs the curriculum of '
+		'the paper (pretraining, phases 0-4) from ./datasets, saving to ./models.'
 	)
-
-	# Phase 0: nicely sampled blobs
-	training_data_filenames = sorted(glob.glob(os.path.join(dataset_dir, 'blobs_train_mode0*.npz')))
-	TrainFundamentalFormPredictor(
-		training_data_filenames,
-		num_epochs=24,
-		learning_rate=1e-5,
-		warmup_steps=1e2,
-		batch_size=1024,
-		n_epochs_to_save=1,
-		n_shapes_to_save=1,
-		load_model_path='models/FundamentalFormPredictor_pretrained.pkl',
-		final_save_filepath='FundamentalFormPredictor_phase0',
+	ap.add_argument('--data-dir', default='datasets', help='training data directory (nice/, simulated/, ...)')
+	ap.add_argument('--models-dir', default=MODELS_DIR, help='where models are saved and loaded between phases')
+	ap.add_argument(
+		'--validation-file', default=None, help='validation data (default: DATA_DIR/ABC17_validation_3.npz)'
 	)
-
-	# Phase 1: nicely sampled blobs and ABC meshes
-	blob_filenames = glob.glob(os.path.join(dataset_dir, 'blobs_train_mode0*.npz'))
-	ABC_filenames = glob.glob(os.path.join(dataset_dir, 'ABC17_train_mode0_*.npz'))
-	lists = [blob_filenames, ABC_filenames]
-	training_data_filenames = [val for tup in zip(*lists) for val in tup]  # interleave lists
-	TrainFundamentalFormPredictor(
-		training_data_filenames,
-		num_epochs=8,
-		learning_rate=1e-5,
-		warmup_steps=1e3,
-		batch_size=1024,
-		n_epochs_to_save=1,
-		n_shapes_to_save=100,
-		load_model_path='models/FundamentalFormPredictor_phase0.pkl',
-		final_save_filepath='FundamentalFormPredictor_phase1',
+	ap.add_argument('--seed', type=int, default=42)
+	ap.add_argument(
+		'--only-phases', default='', help='comma-separated subset of the phases to run: pretrain,phase0,...,phase4'
 	)
+	ap.add_argument('--max-steps', type=int, default=0, help='stop each phase after this many steps (0: all epochs)')
+	ap.add_argument('--log-every', type=int, default=0, help='print the mean loss every N steps (0: off)')
+	return ap.parse_args(argv)
 
-	# Phase 2: nicely sampled blobs and more ABC meshes
-	blob_filenames = glob.glob(os.path.join(dataset_dir, 'blobs_train_mode0*.npz'))
-	ABC17_filenames = glob.glob(os.path.join(dataset_dir, 'ABC17_train_mode0_*.npz'))
-	ABC2_filenames = glob.glob(os.path.join(dataset_dir, 'ABC2_train_mode0_*.npz'))
-	training_data_filenames = blob_filenames + ABC17_filenames + ABC2_filenames
-	TrainFundamentalFormPredictor(
-		training_data_filenames,
-		num_epochs=8,
-		learning_rate=1e-6,
-		warmup_steps=1e3,
-		batch_size=1024,
-		n_epochs_to_save=1,
-		n_shapes_to_save=100,
-		load_model_path='models/FundamentalFormPredictor_phase1.pkl',
-		final_save_filepath='FundamentalFormPredictor_phase2',
-	)
 
-	# Phase 3: nicely sampled blobs and even more ABC meshes
-	blob_filenames = glob.glob(os.path.join(dataset_dir, 'blobs_train_mode0*.npz'))
-	ABC_filenames = glob.glob(os.path.join(dataset_dir, 'ABC*_train_mode0_*.npz'))
-	training_data_filenames = blob_filenames + ABC_filenames
-	TrainFundamentalFormPredictor(
-		training_data_filenames,
-		num_epochs=5,
-		learning_rate=1e-6,
-		warmup_steps=1e3,
-		batch_size=1024,
-		n_epochs_to_save=1,
-		n_shapes_to_save=100,
-		load_model_path='models/FundamentalFormPredictor_phase2.pkl',
-		final_save_filepath='FundamentalFormPredictor_phase3',
-	)
-
-	# Phase 4: everything from before, plus unevenly sampled data possibly with small gaps from a simulated scanning process
-	blob_filenames = glob.glob(os.path.join(dataset_dir, 'blobs_train_mode0*.npz'))
-	ABC_filenames = glob.glob(os.path.join(dataset_dir, 'ABC*_train_mode0_*.npz'))
-	blob_filenames_simulated = glob.glob(os.path.join('datasets/simulated', 'blobs_train_mode*.npz'))
-	ABC_filenames_simulated = glob.glob(os.path.join('datasets/simulated', 'ABC*_train_mode*.npz'))
-	training_data_filenames = blob_filenames + ABC_filenames + blob_filenames_simulated + ABC_filenames_simulated
-	TrainFundamentalFormPredictor(
-		training_data_filenames,
-		num_epochs=2,
-		learning_rate=1e-7,
-		warmup_steps=1e3,
-		batch_size=1024,
-		n_epochs_to_save=1,
-		n_shapes_to_save=100,
-		load_model_path='models/FundamentalFormPredictor_phase3.pkl',
-		final_save_filepath='FundamentalFormPredictor_phase4',
+def main(argv=None):
+	a = parse_args(argv)
+	train(
+		data_dir=a.data_dir,
+		models_dir=a.models_dir,
+		only_phases=[x for x in a.only_phases.split(',') if x] or None,
+		seed=a.seed,
+		validation_file=a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz'),
+		max_steps=a.max_steps,
+		log_every=a.log_every,
 	)
 
 
 if __name__ == '__main__':
-	train()
+	main()
