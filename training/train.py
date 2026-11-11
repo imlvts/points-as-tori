@@ -12,6 +12,12 @@ def sanitize_neighbors(neighbors):
 	return np.where(neighbors < 0, rows, neighbors)
 
 
+def normalize_normals(normals):
+	"""Scale every nonzero normal of a (..., 3) array to unit length."""
+	norms = np.linalg.norm(normals, axis=-1, keepdims=True)
+	return np.where(norms > 0, normals / np.where(norms > 0, norms, 1.0), normals)
+
+
 def load_mesh_training_data(filepath):
 	"""
 	Load training data with mesh information from NPZ file.
@@ -42,6 +48,11 @@ def load_mesh_training_data(filepath):
 	# Padded rows (and the missing neighbors of shapes with fewer than k points) are stored as -1, which would gather
 	# the last, zero-padded point. Point them at the row itself instead.
 	all_neighbors = sanitize_neighbors(all_neighbors)
+
+	# The normals of pretraining_blob.npz and of the validation files have length 2, the others length 1. The torus
+	# fit assumes unit normals (with length L its contact point moves by (L - 1)/|kappa_min| along the normal, which
+	# makes over-curvature free during pretraining). Normalize on load; padded (zero) normals stay zero.
+	all_normals = normalize_normals(all_normals)
 
 	print(f'Loaded mesh training data from {filepath}')
 	print(f'  Shapes: {len(all_positions)} shapes')
