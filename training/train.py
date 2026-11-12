@@ -381,6 +381,7 @@ def TrainFundamentalFormPredictor(
 	resample='',
 	resample_match='',
 	rotate=False,
+	noise=0.0,
 ):
 	"""
 	Args:
@@ -405,6 +406,8 @@ def TrainFundamentalFormPredictor(
 			uniform among the powers of two in [LO, HI], and recomputes the k-NN ('': the stored points)
 		resample_match: resample only shapes whose data file path contains this string ('': all)
 		rotate: apply a random rotation to every shape visit (points, normals and mesh; queries follow the mesh)
+		noise: with multishape: Gaussian noise of standard deviation noise * sigma on the input points of every visit
+			(sigma: the shape's median k-NN distance; normals and the ground truth stay exact; 0: off)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -516,6 +519,8 @@ def TrainFundamentalFormPredictor(
 	total_shapes = len(all_shape_indices)
 	if resample and not multishape:
 		raise ValueError('resample needs multi-shape patch batches (multishape > 0)')
+	if noise and not multishape:
+		raise ValueError('noise needs multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -662,7 +667,7 @@ def TrainFundamentalFormPredictor(
 				dataset_idx, shape_idx = all_shape_indices[g]
 				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
 				shape_resample = resample if (resample and resample_match in training_data_filenames[dataset_idx]) else ''
-				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors, rng, shape_resample, rotate)
+				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors, rng, shape_resample, rotate, noise)
 				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
 				patches.append(patch + (V, F, FM))
 			return patches
@@ -1215,6 +1220,13 @@ def parse_args(argv=None):
 	ap.add_argument(
 		'--rotate', action='store_true', help='random rotation of every shape visit (points, normals, mesh)'
 	)
+	ap.add_argument(
+		'--noise',
+		type=float,
+		default=0.0,
+		metavar='S',
+		help='with --multishape: Gaussian noise of S sigma on the input points (sigma: median k-NN distance; 0: off)',
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1258,6 +1270,7 @@ def main(argv=None):
 		resample=a.resample,
 		resample_match=a.resample_match,
 		rotate=a.rotate,
+		noise=a.noise,
 	)
 
 

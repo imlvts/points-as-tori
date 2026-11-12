@@ -7,7 +7,9 @@ input), the tori of U are blended (masked to U), and the queries are generated p
 to a fixed size (upad) so every step has the same shapes; if U is larger, the points of U nearest the seed are kept.
 
 Per visit of a shape (visit), optionally: fresh area-uniform points on the ground-truth mesh at a random density
-(--resample), with the k-NN recomputed; a random rotation of points, normals and mesh (--rotate).
+(--resample), with the k-NN recomputed; a random rotation of points, normals and mesh (--rotate); Gaussian noise on
+the input points (--noise). Perturbations change the input points only: normals and the ground-truth mesh stay exact,
+so the network learns to fit the clean surface to perturbed input.
 """
 
 import numpy as np
@@ -21,13 +23,21 @@ def random_rotation(rng):
 from scipy.spatial import cKDTree
 
 
-def visit(arrays, k, rng=None, resample='', rotate=False):
+def point_scale(P, tree, k):
+	"""sigma of a cloud: the median over its points of the median distance to their k nearest neighbors."""
+	d, _ = tree.query(P, k=k)
+	return float(np.median(np.median(d, axis=1)))
+
+
+def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0):
 	"""
 	One visit of a stored shape -> (P, N, NB, M, V, F, FM, tree); tree is None when the stored k-NN are used.
 
 	resample 'LO:HI': replace the stored points by n fresh area-uniform samples of the valid faces with their face
 	normals, n drawn uniformly from the powers of two in [LO, HI]; the k-NN then come from tree (a cKDTree).
 	rotate: apply one uniformly random rotation to the points, normals and mesh vertices (k-NN are unchanged).
+	noise: add N(0, (noise sigma)^2) to every coordinate of the points, sigma the cloud's median k-NN distance (before
+		the perturbation); padding is dropped and the k-NN are recomputed on the perturbed points.
 	"""
 	P, N, NB, M, V, F, FM = arrays
 	tree = None
@@ -41,6 +51,12 @@ def visit(arrays, k, rng=None, resample='', rotate=False):
 	if rotate:
 		R = random_rotation(rng)
 		P, N, V = P @ R.T, N @ R.T, V @ R.T
+	if noise:
+		P, N = P[M], N[M]
+		M = np.ones(len(P), bool)
+		sigma = point_scale(P, cKDTree(P), k)
+		P = P + rng.normal(size=P.shape) * (noise * sigma)
+		NB = None
 	if NB is None:
 		tree = cKDTree(P)
 	return P, N, NB, M, V, F, FM, tree
