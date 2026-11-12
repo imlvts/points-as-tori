@@ -380,6 +380,7 @@ def TrainFundamentalFormPredictor(
 	save_every=10000,
 	resample='',
 	resample_match='',
+	rotate=False,
 ):
 	"""
 	Args:
@@ -403,6 +404,7 @@ def TrainFundamentalFormPredictor(
 		resample: 'LO:HI' with multishape: every visit of a shape draws fresh points on its ground-truth mesh, their count
 			uniform among the powers of two in [LO, HI], and recomputes the k-NN ('': the stored points)
 		resample_match: resample only shapes whose data file path contains this string ('': all)
+		rotate: apply a random rotation to every shape visit (points, normals and mesh; queries follow the mesh)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -660,7 +662,7 @@ def TrainFundamentalFormPredictor(
 				dataset_idx, shape_idx = all_shape_indices[g]
 				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
 				shape_resample = resample if (resample and resample_match in training_data_filenames[dataset_idx]) else ''
-				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors, rng, shape_resample)
+				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors, rng, shape_resample, rotate)
 				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
 				patches.append(patch + (V, F, FM))
 			return patches
@@ -739,6 +741,7 @@ def TrainFundamentalFormPredictor(
 	num_training_datasets = len(all_training_data)
 	np.random.seed(seed)
 
+	rotation_rng = np.random.default_rng(seed + 2000)  # --rotate in the authors' loop
 	step = 0  # optimizer steps in this phase
 	log_buffer = []
 	t_log = time.time()
@@ -784,6 +787,9 @@ def TrainFundamentalFormPredictor(
 			neighbors = jnp.array(all_neighbors[shape_idx])
 			mask = jnp.array(all_masks[shape_idx])
 			mesh_vertices = jnp.array(all_mesh_vertices[shape_idx])
+			if rotate:
+				R = jnp.array(augment.random_rotation(rotation_rng))
+				positions, normals, mesh_vertices = positions @ R.T, normals @ R.T, mesh_vertices @ R.T
 			mesh_faces = jnp.array(all_mesh_faces[shape_idx])
 			face_mask = jnp.array(all_face_masks[shape_idx])
 
@@ -1206,6 +1212,9 @@ def parse_args(argv=None):
 	ap.add_argument(
 		'--resample-match', default='', help='resample only shapes whose data file path contains this string (default: all)'
 	)
+	ap.add_argument(
+		'--rotate', action='store_true', help='random rotation of every shape visit (points, normals, mesh)'
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1248,6 +1257,7 @@ def main(argv=None):
 		save_every=a.save_every,
 		resample=a.resample,
 		resample_match=a.resample_match,
+		rotate=a.rotate,
 	)
 
 

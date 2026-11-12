@@ -7,20 +7,27 @@ input), the tori of U are blended (masked to U), and the queries are generated p
 to a fixed size (upad) so every step has the same shapes; if U is larger, the points of U nearest the seed are kept.
 
 Per visit of a shape (visit), optionally: fresh area-uniform points on the ground-truth mesh at a random density
-(--resample), with the k-NN recomputed.
+(--resample), with the k-NN recomputed; a random rotation of points, normals and mesh (--rotate).
 """
 
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
+
+
+def random_rotation(rng):
+	"""A uniformly random rotation matrix (3, 3)."""
+	return Rotation.random(random_state=rng).as_matrix()
 from scipy.spatial import cKDTree
 
 
-def visit(arrays, k, rng=None, resample=''):
+def visit(arrays, k, rng=None, resample='', rotate=False):
 	"""
 	One visit of a stored shape -> (P, N, NB, M, V, F, FM, tree); tree is None when the stored k-NN are used.
 
 	resample 'LO:HI': replace the stored points by n fresh area-uniform samples of the valid faces with their face
 	normals, n drawn uniformly from the powers of two in [LO, HI]; the k-NN then come from tree (a cKDTree).
+	rotate: apply one uniformly random rotation to the points, normals and mesh vertices (k-NN are unchanged).
 	"""
 	P, N, NB, M, V, F, FM = arrays
 	tree = None
@@ -31,6 +38,9 @@ def visit(arrays, k, rng=None, resample=''):
 		NB = None
 	else:
 		NB = NB[:, :k]
+	if rotate:
+		R = random_rotation(rng)
+		P, N, V = P @ R.T, N @ R.T, V @ R.T
 	if NB is None:
 		tree = cKDTree(P)
 	return P, N, NB, M, V, F, FM, tree
