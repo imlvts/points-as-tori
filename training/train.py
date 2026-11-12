@@ -1179,12 +1179,14 @@ def train(
 	max_steps=0,
 	learning_rate=None,
 	warmup_steps=None,
+	gate=False,
 	**options,
 ):
 	"""
 	Run the curriculum: the authors' (default) or the phases phase_specs (see custom_curriculum).
 	only_phases: names of the phases to run (None: all). learning_rate, warmup_steps: override every phase value (None:
-	the curriculum value). init: weights of the first phase that runs ('random' or a
+	the curriculum value). gate: after every phase, evaluate its model with eval_model.py and print the gate checks
+	(log only). init: weights of the first phase that runs ('random' or a
 	.pkl path; None: the curriculum's own). skip_pretraining: drop the authors' pretraining; phase 0 then starts from
 	init (default: a fresh initialization). max_steps: cap on the steps of every phase (0: none).
 	options: further keyword arguments of TrainFundamentalFormPredictor, the same for every phase.
@@ -1210,6 +1212,16 @@ def train(
 		steps = min(x for x in (phase_steps, max_steps) if x) if (phase_steps or max_steps) else 0
 		print(f'\n===== {name} =====', flush=True)
 		TrainFundamentalFormPredictor(**phase, models_dir=models_dir, max_steps=steps, **options)
+		if gate:
+			import eval_model
+
+			path = os.path.join(models_dir, phase['final_save_filepath'] + '.pkl')
+			res = eval_model.evaluate(
+				path, label=name, out_dir=os.path.join(models_dir, 'eval'), validation_file=options.get('validation_file')
+			)
+			print(f'\n===== gate {name} ({path}) =====\n{eval_model.HEAD}\n{eval_model.row(res)}', flush=True)
+			lines, passed = eval_model.gate_report(res)
+			print('\n'.join(lines) + f'\n[gate] {name}: {"all checks pass" if passed else "some checks MISS"}', flush=True)
 
 
 def parse_args(argv=None):
@@ -1243,6 +1255,11 @@ def parse_args(argv=None):
 		'--only-phases', default='', help='comma-separated subset of the phases to run: pretrain,phase0,...,phase4'
 	)
 	ap.add_argument('--max-steps', type=int, default=0, help='stop each phase after this many steps (0: all epochs)')
+	ap.add_argument(
+		'--gate',
+		action='store_true',
+		help='after every phase, evaluate its model (eval_model.py, about 2 min) and print the gate checks; log only',
+	)
 	ap.add_argument('--log-every', type=int, default=0, help='print the mean loss every N steps (0: off)')
 	ap.add_argument('--lr', type=float, default=None, help="peak learning rate of every phase (default: the curriculum's)")
 	ap.add_argument('--warmup', type=int, default=None, help="linear warmup steps of every phase (default: the curriculum's)")
@@ -1323,6 +1340,7 @@ def main(argv=None):
 		phase_specs=a.phase,
 		init=a.init,
 		skip_pretraining=a.skip_pretraining,
+		gate=a.gate,
 		seed=a.seed,
 		validation_file=a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz'),
 		max_steps=a.max_steps,
