@@ -313,6 +313,7 @@ def TrainFundamentalFormPredictor(
 	log_every=0,
 	knn_blend=0,
 	min_points=0,
+	schedule='authors',
 ):
 	"""
 	Args:
@@ -324,6 +325,8 @@ def TrainFundamentalFormPredictor(
 		log_every: print the mean loss of the last log_every steps (0: off)
 		knn_blend: train (and validate) with the blend over the K nearest points of each query (0: all points)
 		min_points: drop training shapes with fewer valid points (0: keep all)
+		schedule: 'authors' (linear warmup, then cosine decay over 1e8 steps, i.e. constant in practice) or 'cosine'
+			(linear warmup, then cosine decay to 1 % of the learning rate at max_steps)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -352,7 +355,14 @@ def TrainFundamentalFormPredictor(
 	# Learning parameters
 	dropout_rate = 0.0
 	weight_decay = 0.0
-	total_steps = 1e8
+	if schedule == 'authors':
+		total_steps = 1e8
+	elif schedule == 'cosine':
+		if not max_steps:
+			raise ValueError("schedule 'cosine' needs the number of steps of the phase (max_steps)")
+		total_steps = max_steps
+	else:
+		raise ValueError(f'unknown schedule {schedule!r}')
 
 	model, optimizer, train_step = FundamentalFormPredictorTrainer(
 		embed_dim=embed_dim,
@@ -932,11 +942,14 @@ def train(
 	init=None,
 	skip_pretraining=False,
 	max_steps=0,
+	learning_rate=None,
+	warmup_steps=None,
 	**options,
 ):
 	"""
 	Run the curriculum: the authors' (default) or the phases phase_specs (see custom_curriculum).
-	only_phases: names of the phases to run (None: all). init: weights of the first phase that runs ('random' or a
+	only_phases: names of the phases to run (None: all). learning_rate, warmup_steps: override every phase value (None:
+	the curriculum value). init: weights of the first phase that runs ('random' or a
 	.pkl path; None: the curriculum's own). skip_pretraining: drop the authors' pretraining; phase 0 then starts from
 	init (default: a fresh initialization). max_steps: cap on the steps of every phase (0: none).
 	options: further keyword arguments of TrainFundamentalFormPredictor, the same for every phase.
@@ -955,6 +968,10 @@ def train(
 		if i == 0 and init is not None:
 			phase['load_model_path'] = init
 		phase_steps = phase.pop('max_steps', 0)
+		if learning_rate is not None:
+			phase['learning_rate'] = learning_rate
+		if warmup_steps is not None:
+			phase['warmup_steps'] = warmup_steps
 		steps = min(x for x in (phase_steps, max_steps) if x) if (phase_steps or max_steps) else 0
 		print(f'\n===== {name} =====', flush=True)
 		TrainFundamentalFormPredictor(**phase, models_dir=models_dir, max_steps=steps, **options)
@@ -992,6 +1009,14 @@ def parse_args(argv=None):
 	)
 	ap.add_argument('--max-steps', type=int, default=0, help='stop each phase after this many steps (0: all epochs)')
 	ap.add_argument('--log-every', type=int, default=0, help='print the mean loss every N steps (0: off)')
+	ap.add_argument('--lr', type=float, default=None, help="peak learning rate of every phase (default: the curriculum's)")
+	ap.add_argument('--warmup', type=int, default=None, help="linear warmup steps of every phase (default: the curriculum's)")
+	ap.add_argument(
+		'--schedule',
+		choices=['authors', 'cosine'],
+		default='authors',
+		help="authors: cosine decay over 1e8 steps (constant in practice); cosine: decay to 1 %% of the lr over each phase's steps",
+	)
 	ap.add_argument(
 		'--min-points', type=int, default=0, help='drop training shapes with fewer valid points (0: keep all)'
 	)
@@ -1019,6 +1044,9 @@ def main(argv=None):
 		log_every=a.log_every,
 		knn_blend=a.knn_blend,
 		min_points=a.min_points,
+		learning_rate=a.lr,
+		warmup_steps=a.warmup,
+		schedule=a.schedule,
 	)
 
 
