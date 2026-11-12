@@ -368,8 +368,8 @@ def TrainFundamentalFormPredictor(
 		knn_blend=knn_blend,
 	)
 
-	# Load pretrained model if specified
-	if load_model_path is not None:
+	# Load pretrained model if specified ('random' or None: keep the fresh initialization)
+	if load_model_path is not None and load_model_path != 'random':
 		print(f'Loading pretrained model from {load_model_path}')
 		with open(load_model_path, 'rb') as f:
 			saved_data = pickle.load(f)
@@ -882,17 +882,75 @@ def authors_curriculum(data_dir='datasets', models_dir=MODELS_DIR):
 	]
 
 
-def train(data_dir='datasets', models_dir=MODELS_DIR, only_phases=None, **options):
+def custom_curriculum(phase_specs, data_dir='datasets', models_dir=MODELS_DIR):
 	"""
-	Run the curriculum. only_phases: names of the phases to run (None: all); options: further keyword arguments of
-	TrainFundamentalFormPredictor, the same for every phase.
+	Phases given as 'NAME:GLOBS:STEPS' strings: GLOBS is a comma-separated list of file patterns relative to data_dir
+	(each sorted, then concatenated), STEPS the number of optimizer steps of the phase. The other settings are those of
+	the authors' phase 1 (lr 1e-5, 1000 warmup steps, batch size 1024); the first phase starts from a fresh
+	initialization, every later one from the model saved by the previous phase.
 	"""
-	for phase in authors_curriculum(data_dir, models_dir):
+	phases, previous = [], None
+	for spec in phase_specs:
+		name, patterns, steps = spec.split(':')
+		files = []
+		for pattern in patterns.split(','):
+			matches = sorted(glob.glob(os.path.join(data_dir, pattern)))
+			if not matches:
+				raise ValueError(f"--phase {spec}: no file matches '{os.path.join(data_dir, pattern)}'")
+			files += matches
+		phases.append(
+			dict(
+				name=name,
+				training_data_filenames=files,
+				num_epochs=1_000_000,
+				learning_rate=1e-5,
+				warmup_steps=1e3,
+				batch_size=1024,
+				n_epochs_to_save=1,
+				n_shapes_to_save=100,
+				load_model_path=previous,
+				final_save_filepath=f'FundamentalFormPredictor_{name}',
+				max_steps=int(steps),
+			)
+		)
+		previous = os.path.join(models_dir, f'FundamentalFormPredictor_{name}.pkl')
+	return phases
+
+
+def train(
+	data_dir='datasets',
+	models_dir=MODELS_DIR,
+	only_phases=None,
+	phase_specs=None,
+	init=None,
+	skip_pretraining=False,
+	max_steps=0,
+	**options,
+):
+	"""
+	Run the curriculum: the authors' (default) or the phases phase_specs (see custom_curriculum).
+	only_phases: names of the phases to run (None: all). init: weights of the first phase that runs ('random' or a
+	.pkl path; None: the curriculum's own). skip_pretraining: drop the authors' pretraining; phase 0 then starts from
+	init (default: a fresh initialization). max_steps: cap on the steps of every phase (0: none).
+	options: further keyword arguments of TrainFundamentalFormPredictor, the same for every phase.
+	"""
+	if phase_specs:
+		phases = custom_curriculum(phase_specs, data_dir, models_dir)
+	else:
+		phases = authors_curriculum(data_dir, models_dir)
+		if skip_pretraining:
+			phases = [ph for ph in phases if ph['name'] != 'pretrain']
+			phases[0]['load_model_path'] = None
+	if only_phases:
+		phases = [ph for ph in phases if ph['name'] in only_phases]
+	for i, phase in enumerate(phases):
 		name = phase.pop('name')
-		if only_phases and name not in only_phases:
-			continue
+		if i == 0 and init is not None:
+			phase['load_model_path'] = init
+		phase_steps = phase.pop('max_steps', 0)
+		steps = min(x for x in (phase_steps, max_steps) if x) if (phase_steps or max_steps) else 0
 		print(f'\n===== {name} =====', flush=True)
-		TrainFundamentalFormPredictor(**phase, models_dir=models_dir, **options)
+		TrainFundamentalFormPredictor(**phase, models_dir=models_dir, max_steps=steps, **options)
 
 
 def parse_args(argv=None):
@@ -906,6 +964,22 @@ def parse_args(argv=None):
 		'--validation-file', default=None, help='validation data (default: DATA_DIR/ABC17_validation_3.npz)'
 	)
 	ap.add_argument('--seed', type=int, default=42)
+	ap.add_argument(
+		'--phase',
+		action='append',
+		default=[],
+		metavar='NAME:GLOBS:STEPS',
+		help='run this phase instead of the authors\' curriculum (repeatable, in order); GLOBS: comma-separated file '
+		'patterns relative to --data-dir; each phase starts from the previous one',
+	)
+	ap.add_argument(
+		'--init', default=None, help="initial weights of the first phase: 'random' or a .pkl (default: the curriculum's)"
+	)
+	ap.add_argument(
+		'--skip-pretraining',
+		action='store_true',
+		help='drop the pretraining phase of the authors\' curriculum; phase 0 starts from --init (default: random)',
+	)
 	ap.add_argument(
 		'--only-phases', default='', help='comma-separated subset of the phases to run: pretrain,phase0,...,phase4'
 	)
@@ -926,6 +1000,9 @@ def main(argv=None):
 		data_dir=a.data_dir,
 		models_dir=a.models_dir,
 		only_phases=[x for x in a.only_phases.split(',') if x] or None,
+		phase_specs=a.phase,
+		init=a.init,
+		skip_pretraining=a.skip_pretraining,
 		seed=a.seed,
 		validation_file=a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz'),
 		max_steps=a.max_steps,
