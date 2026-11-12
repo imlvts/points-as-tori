@@ -383,6 +383,7 @@ def TrainFundamentalFormPredictor(
 	rotate=False,
 	noise=0.0,
 	quantize=0.0,
+	mix='',
 ):
 	"""
 	Args:
@@ -411,6 +412,9 @@ def TrainFundamentalFormPredictor(
 			(sigma: the shape's median k-NN distance; normals and the ground truth stay exact; 0: off)
 		quantize: with multishape: round the input points' coordinate along a random direction (one per visit) to
 			multiples of quantize * sigma, as a depth scanner does (0: off)
+		mix: 'analytic:FRAC:PATH' with multishape: each patch slot is, with probability FRAC, a patch of an analytic scene
+			of PATH (gen_analytic.py) with exact-SDF queries (analytic_sdf.analytic_queries) instead of a data shape;
+			resample and rotate apply to the analytic scenes too ('': off)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -524,6 +528,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('resample needs multi-shape patch batches (multishape > 0)')
 	if (noise or quantize) and not multishape:
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
+	if mix and not multishape:
+		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -657,6 +663,31 @@ def TrainFundamentalFormPredictor(
 		rng = np.random.default_rng(seed + 1000)
 		stream = []
 
+		mix_fraction, scenes = 0.0, None
+		if mix:
+			import analytic_scene
+			import analytic_sdf
+
+			kind, fraction, path = mix.split(':', 2)
+			if kind != 'analytic':
+				raise ValueError(f'mix {mix!r}: expected analytic:FRACTION:PATH')
+			mix_fraction = float(fraction)
+			scenes = dict(np.load(path))
+			print(f'Mixing analytic scenes with probability {mix_fraction} ({len(scenes["sigma"])} scenes from {path})')
+
+		def prepare_analytic():
+			i = int(rng.integers(len(scenes['sigma'])))
+			E, types, polys, pcount = scenes['prims'][i], scenes['types'][i], scenes['polys'][i], scenes['pcount'][i]
+			if resample:
+				n = int(rng.choice(augment.resample_counts(resample)))
+				P, N, _, _, _, _ = analytic_scene.sample_scene(analytic_scene.decode(E, types, polys, pcount), n, rng)
+			else:
+				P, N = scenes['P'][i], scenes['N'][i]
+			R = augment.random_rotation(rng) if rotate else np.eye(3)
+			P, N = P @ R.T, N @ R.T
+			patch = augment.make_patch(P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng)
+			return patch + ('analytic', (E, types, polys, pcount, R))
+
 		def next_shapes():
 			nonlocal stream
 			while len(stream) < multishape:
@@ -667,6 +698,9 @@ def TrainFundamentalFormPredictor(
 		def prepare(global_indices):
 			patches = []
 			for g in global_indices:
+				if mix_fraction > 0 and rng.uniform() < mix_fraction:
+					patches.append(prepare_analytic())
+					continue
 				dataset_idx, shape_idx = all_shape_indices[g]
 				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
 				shape_resample = resample if (resample and resample_match in training_data_filenames[dataset_idx]) else ''
@@ -680,12 +714,30 @@ def TrainFundamentalFormPredictor(
 		pool = concurrent.futures.ThreadPoolExecutor(1)
 		future = pool.submit(prepare, next_shapes())
 		step, log_buffer, union_sizes, t_log = 0, [], [], time.time()
+		n_analytic = 0
 		while step < max_steps:
 			patches = future.result()
 			future = pool.submit(prepare, next_shapes())
 			step_key = jax.random.fold_in(key, step)
 			queries, distances = [], []
 			for j, pt in enumerate(patches):
+				if isinstance(pt[7], str):  # analytic scene: exact-SDF queries
+					E, types, polys, pcount, R = pt[8]
+					q, d, _ = analytic_sdf.analytic_queries(
+						jnp.asarray(pt[5]),
+						jnp.asarray(E),
+						jnp.asarray(types),
+						jnp.asarray(polys),
+						jnp.asarray(pcount),
+						jnp.asarray(R, jnp.float32),
+						jax.random.fold_in(step_key, j),
+						bbox_extension=bbox_extension,
+					)
+					queries.append(q)
+					distances.append(d)
+					union_sizes.append(pt[6])
+					n_analytic += 1
+					continue
 				q, d = generate_neighborhood_features(
 					jnp.asarray(pt[5]),
 					jnp.asarray(pt[7], jnp.float32),
@@ -710,7 +762,8 @@ def TrainFundamentalFormPredictor(
 				now = time.time()
 				print(
 					f'[step] {step} loss {v[:, 0].mean():.8f} distance {v[:, 1].mean():.8f} eikonality {v[:, 2].mean():.8f} '
-					f'{(now - t_log) / len(v):.3f} s/step union mean {np.mean(union_sizes):.0f} max {np.max(union_sizes)}',
+					f'{(now - t_log) / len(v):.3f} s/step union mean {np.mean(union_sizes):.0f} max {np.max(union_sizes)}'
+					+ (f' analytic patches {n_analytic}' if mix else ''),
 					flush=True,
 				)
 				if not np.all(np.isfinite(v)):
@@ -1239,6 +1292,13 @@ def parse_args(argv=None):
 		metavar='Q',
 		help='with --multishape: quantize the input points along a random direction per visit to steps of Q sigma (0: off)',
 	)
+	ap.add_argument(
+		'--mix',
+		default='',
+		metavar='analytic:FRAC:PATH',
+		help='with --multishape: each patch is, with probability FRAC, from an analytic scene of PATH (gen_analytic.py) '
+		'with exact-SDF queries (default: off)',
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1284,6 +1344,7 @@ def main(argv=None):
 		rotate=a.rotate,
 		noise=a.noise,
 		quantize=a.quantize,
+		mix=a.mix,
 	)
 
 
