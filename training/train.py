@@ -312,6 +312,7 @@ def TrainFundamentalFormPredictor(
 	max_steps=0,
 	log_every=0,
 	knn_blend=0,
+	min_points=0,
 ):
 	"""
 	Args:
@@ -322,6 +323,7 @@ def TrainFundamentalFormPredictor(
 		max_steps: stop after this many optimizer steps (0: run all epochs)
 		log_every: print the mean loss of the last log_every steps (0: off)
 		knn_blend: train (and validate) with the blend over the K nearest points of each query (0: all points)
+		min_points: drop training shapes with fewer valid points (0: keep all)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -396,6 +398,11 @@ def TrainFundamentalFormPredictor(
 		print(f"Loading training data from '{training_data_filename}'...")
 
 		data = load_mesh_training_data(training_data_filename)
+		if min_points:
+			keep = data[3].sum(axis=1) >= min_points
+			if not keep.all():
+				print(f'  Dropping {int((~keep).sum())} shapes with fewer than {min_points} points')
+				data = tuple(x[keep] for x in data)
 
 		(all_positions, all_normals, all_neighbors, all_masks, all_mesh_vertices, all_mesh_faces, all_face_masks) = data
 
@@ -986,6 +993,9 @@ def parse_args(argv=None):
 	ap.add_argument('--max-steps', type=int, default=0, help='stop each phase after this many steps (0: all epochs)')
 	ap.add_argument('--log-every', type=int, default=0, help='print the mean loss every N steps (0: off)')
 	ap.add_argument(
+		'--min-points', type=int, default=0, help='drop training shapes with fewer valid points (0: keep all)'
+	)
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1008,6 +1018,7 @@ def main(argv=None):
 		max_steps=a.max_steps,
 		log_every=a.log_every,
 		knn_blend=a.knn_blend,
+		min_points=a.min_points,
 	)
 
 
