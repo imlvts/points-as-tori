@@ -8,7 +8,7 @@ to a fixed size (upad) so every step has the same shapes; if U is larger, the po
 
 Per visit of a shape (visit), optionally: fresh area-uniform points on the ground-truth mesh at a random density
 (--resample), with the k-NN recomputed; a random rotation of points, normals and mesh (--rotate); Gaussian noise on
-the input points (--noise). Perturbations change the input points only: normals and the ground-truth mesh stay exact,
+the input points (--noise); directional quantization of the input points (--quantize). Perturbations change the input points only: normals and the ground-truth mesh stay exact,
 so the network learns to fit the clean surface to perturbed input.
 """
 
@@ -29,7 +29,14 @@ def point_scale(P, tree, k):
 	return float(np.median(np.median(d, axis=1)))
 
 
-def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0):
+def quantize_along(P, direction, step):
+	"""Round the coordinate of every point along the unit vector direction to a multiple of step (the depth
+	quantization of a scanner looking along direction); the two other coordinates are unchanged."""
+	h = P @ direction
+	return P + (step * np.round(h / step) - h)[:, None] * direction[None, :]
+
+
+def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.0):
 	"""
 	One visit of a stored shape -> (P, N, NB, M, V, F, FM, tree); tree is None when the stored k-NN are used.
 
@@ -38,6 +45,8 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0):
 	rotate: apply one uniformly random rotation to the points, normals and mesh vertices (k-NN are unchanged).
 	noise: add N(0, (noise sigma)^2) to every coordinate of the points, sigma the cloud's median k-NN distance (before
 		the perturbation); padding is dropped and the k-NN are recomputed on the perturbed points.
+	quantize: round the coordinate of the points along a random direction (one per visit) to multiples of
+		quantize sigma (applied before the noise); padding is dropped and the k-NN are recomputed.
 	"""
 	P, N, NB, M, V, F, FM = arrays
 	tree = None
@@ -51,11 +60,16 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0):
 	if rotate:
 		R = random_rotation(rng)
 		P, N, V = P @ R.T, N @ R.T, V @ R.T
-	if noise:
+	if noise or quantize:
 		P, N = P[M], N[M]
 		M = np.ones(len(P), bool)
 		sigma = point_scale(P, cKDTree(P), k)
-		P = P + rng.normal(size=P.shape) * (noise * sigma)
+		if quantize:
+			direction = rng.normal(size=3)
+			direction /= np.linalg.norm(direction)
+			P = quantize_along(P, direction, quantize * sigma)
+		if noise:
+			P = P + rng.normal(size=P.shape) * (noise * sigma)
 		NB = None
 	if NB is None:
 		tree = cKDTree(P)
