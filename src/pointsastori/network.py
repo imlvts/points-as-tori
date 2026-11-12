@@ -380,7 +380,7 @@ def torus_signed_distance(q, center, axis, major_radius, minor_radius):
 	return g_z
 
 
-@jit
+@partial(jit, static_argnames=['knn'])
 def torus_distance_gradient_masked(
 	mask: jnp.ndarray,
 	queries: jnp.ndarray,
@@ -389,9 +389,15 @@ def torus_distance_gradient_masked(
 	axes: jnp.ndarray,
 	major_radii: jnp.ndarray,
 	minor_radii: jnp.ndarray,
+	knn: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 	"""
 	Only sum over torii at valid points (where mask is True).
+
+	knn = 0 (default): the blend runs over all valid points, with the shift (and lambda) from the query's 64 nearest
+	valid points. knn = K > 0: the blend runs over the K nearest valid points of each query only, with the shift half
+	the largest distance in that set and lambda = 64 / shift; this is the rule of the accelerated (k-NN) evaluation
+	at inference.
 
 	Args:
 		mask: (max_points,) - boolean mask indicating valid points
@@ -425,22 +431,38 @@ def torus_distance_gradient_masked(
 	# Reshape for broadcasting: queries (batch, n_queries, 1, 3)
 	q = queries[:, :, None, :]  # (batch, n_queries, 1, 3)
 
-	# Broadcast points, centers, etc. for all queries
-	# (1, 1, max_points, 3)
-	p_i = points[None, None, :, :]
+	if knn:
+		# Gather the knn nearest valid points of each query: (batch, n_queries, knn[, 3]) arrays replace the
+		# (1, 1, max_points[, 3]) broadcasts below; the per-torus formulas are the same.
+		d_all = jnp.linalg.norm(q - points[None, None, :, :], axis=-1)
+		d_all = jnp.where(valid_torus_mask[None, None, :], d_all, jnp.inf)
+		_, nearest = jax.lax.top_k(-jax.lax.stop_gradient(d_all), knn)  # (batch, n_queries, knn)
+		p_i = points[nearest]
+		rVec = q - p_i  # (batch, n_queries, knn, 3)
+		dist_to_point = jnp.linalg.norm(rVec, axis=-1)  # (batch, n_queries, knn)
+		mask_i = valid_torus_mask[nearest]
+		shifts = 0.5 * jnp.max(jnp.where(mask_i, dist_to_point, 0.0), axis=-1)  # (batch, n_queries)
+		c_i = centers[nearest]
+		axis_i = axis3d[nearest]
+		R_i = major_radii[nearest]
+		r_i = minor_radii[nearest]
+	else:
+		# Broadcast points, centers, etc. for all queries
+		# (1, 1, max_points, 3)
+		p_i = points[None, None, :, :]
 
-	# Compute query-to-point distances once and reuse for both shift and weight computation.
-	# This avoids materializing the (batch, n_queries, max_points) distance tensor twice.
-	rVec = q - p_i  # (batch, n_queries, max_points, 3)
-	dist_to_point = jnp.linalg.norm(rVec, axis=-1)  # (batch, n_queries, max_points)
+		# Compute query-to-point distances once and reuse for both shift and weight computation.
+		# This avoids materializing the (batch, n_queries, max_points) distance tensor twice.
+		rVec = q - p_i  # (batch, n_queries, max_points, 3)
+		dist_to_point = jnp.linalg.norm(rVec, axis=-1)  # (batch, n_queries, max_points)
 
-	shifts = _compute_shifts_from_distances(dist_to_point, valid_torus_mask)  # (batch, n_queries)
+		shifts = _compute_shifts_from_distances(dist_to_point, valid_torus_mask)  # (batch, n_queries)
+		c_i = centers[None, None, :, :]
+		axis_i = axis3d[None, None, :, :]
+		R_i = major_radii[None, None, :]
+		r_i = minor_radii[None, None, :]
+		mask_i = valid_torus_mask[None, None, :]  # (1, 1, max_points)
 	lam = compute_lambdas_jax(shifts)  # (batch_size, n_queries)
-	c_i = centers[None, None, :, :]
-	axis_i = axis3d[None, None, :, :]
-	R_i = major_radii[None, None, :]
-	r_i = minor_radii[None, None, :]
-	mask_i = valid_torus_mask[None, None, :]  # (1, 1, max_points)
 
 	# Distance from query to torus center
 	r_vec = q - c_i  # (batch, n_queries, max_points, 3)

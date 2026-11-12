@@ -79,7 +79,7 @@ def load_mesh_training_data(filepath):
 # ========================================================================
 
 
-@jit
+@partial(jit, static_argnames=['knn_blend'])
 def SDF_loss(
 	mask,
 	batch_mask,
@@ -88,6 +88,7 @@ def SDF_loss(
 	coefficients,
 	queries,
 	true_distances,
+	knn_blend=0,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -100,12 +101,13 @@ def SDF_loss(
 		coefficients: (max_points, 6) all point coefficients
 		queries: (batch_size, n_queries, 2)
 		true_distances: (batch_size, n_queries,)
+		knn_blend: blend over the knn_blend nearest points of each query (0: all points; see torus_distance_gradient_masked)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
 
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii
+		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -145,7 +147,7 @@ def SDF_loss(
 	return loss, loss_dict
 
 
-@jit
+@partial(jit, static_argnames=['knn_blend'])
 def validation_loss(
 	mask,
 	batch_mask,
@@ -154,11 +156,12 @@ def validation_loss(
 	coefficients,
 	queries,
 	true_distances,
+	knn_blend=0,
 ):
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
 
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii
+		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -203,6 +206,7 @@ def FundamentalFormPredictorTrainer(
 	warmup_steps=1000,
 	total_steps=100000,
 	seed=42,
+	knn_blend=0,
 ):
 	"""
 	Set up network (model) with the given parameters.
@@ -268,7 +272,9 @@ def FundamentalFormPredictorTrainer(
 		def loss_fn(model):
 			coefficients = model(positions[neighbors], normals[neighbors])
 
-			loss, loss_dict = SDF_loss(mask, batch_mask, positions, normals, coefficients, queries, true_distances)
+			loss, loss_dict = SDF_loss(
+				mask, batch_mask, positions, normals, coefficients, queries, true_distances, knn_blend=knn_blend
+			)
 
 			return loss, loss_dict
 
@@ -305,6 +311,7 @@ def TrainFundamentalFormPredictor(
 	validation_file='datasets/ABC17_validation_3.npz',
 	max_steps=0,
 	log_every=0,
+	knn_blend=0,
 ):
 	"""
 	Args:
@@ -314,6 +321,7 @@ def TrainFundamentalFormPredictor(
 		validation_file: validation data (skipped if the file does not exist)
 		max_steps: stop after this many optimizer steps (0: run all epochs)
 		log_every: print the mean loss of the last log_every steps (0: off)
+		knn_blend: train (and validate) with the blend over the K nearest points of each query (0: all points)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -357,6 +365,7 @@ def TrainFundamentalFormPredictor(
 		warmup_steps=warmup_steps,
 		total_steps=total_steps,
 		seed=seed,
+		knn_blend=knn_blend,
 	)
 
 	# Load pretrained model if specified
@@ -516,6 +525,7 @@ def TrainFundamentalFormPredictor(
 						val_weights,
 						batch_queries,
 						batch_distances,
+						knn_blend=knn_blend,
 					)
 					batch_val_losses.append(val_loss)
 					batch_val_eikonality_losses.append(val_eikonality_loss)
@@ -901,6 +911,12 @@ def parse_args(argv=None):
 	)
 	ap.add_argument('--max-steps', type=int, default=0, help='stop each phase after this many steps (0: all epochs)')
 	ap.add_argument('--log-every', type=int, default=0, help='print the mean loss every N steps (0: off)')
+	ap.add_argument(
+		'--knn-blend',
+		type=int,
+		default=0,
+		help='blend the tori over the K nearest points of each query, as the accelerated inference does (0: all points)',
+	)
 	return ap.parse_args(argv)
 
 
@@ -914,6 +930,7 @@ def main(argv=None):
 		validation_file=a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz'),
 		max_steps=a.max_steps,
 		log_every=a.log_every,
+		knn_blend=a.knn_blend,
 	)
 
 
