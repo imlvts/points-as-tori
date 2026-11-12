@@ -79,7 +79,7 @@ def load_mesh_training_data(filepath):
 # ========================================================================
 
 
-@partial(jit, static_argnames=['knn_blend'])
+@partial(jit, static_argnames=['knn_blend', 'eikonal_weight'])
 def SDF_loss(
 	mask,
 	batch_mask,
@@ -89,6 +89,7 @@ def SDF_loss(
 	queries,
 	true_distances,
 	knn_blend=0,
+	eikonal_weight=1.0,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -102,6 +103,7 @@ def SDF_loss(
 		queries: (batch_size, n_queries, 2)
 		true_distances: (batch_size, n_queries,)
 		knn_blend: blend over the knn_blend nearest points of each query (0: all points; see torus_distance_gradient_masked)
+		eikonal_weight: weight of the eikonality term (the distance term has weight 1)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
@@ -136,7 +138,7 @@ def SDF_loss(
 		lambda: 0.0,
 	)
 
-	loss = distance_loss + eikonality_loss
+	loss = distance_loss + eikonal_weight * eikonality_loss
 
 	# Return individual components for logging
 	loss_dict = {
@@ -208,9 +210,11 @@ def FundamentalFormPredictorTrainer(
 	seed=42,
 	knn_blend=0,
 	clip=0.0,
+	eikonal_weight=1.0,
 ):
 	"""
 	Set up network (model) with the given parameters.
+	eikonal_weight: weight of the eikonality term of the loss
 	clip: clip the gradient to this global norm before the AdamW update (0: no clipping)
 
 	Returns: (model, optimizer, train_step) where train_step() is a function that trains the model for a single step.
@@ -275,7 +279,15 @@ def FundamentalFormPredictorTrainer(
 			coefficients = model(positions[neighbors], normals[neighbors])
 
 			loss, loss_dict = SDF_loss(
-				mask, batch_mask, positions, normals, coefficients, queries, true_distances, knn_blend=knn_blend
+				mask,
+				batch_mask,
+				positions,
+				normals,
+				coefficients,
+				queries,
+				true_distances,
+				knn_blend=knn_blend,
+				eikonal_weight=eikonal_weight,
 			)
 
 			return loss, loss_dict
@@ -318,6 +330,7 @@ def TrainFundamentalFormPredictor(
 	schedule='authors',
 	clip=0.0,
 	weight_decay=0.0,
+	eikonal_weight=1.0,
 ):
 	"""
 	Args:
@@ -333,6 +346,7 @@ def TrainFundamentalFormPredictor(
 			(linear warmup, then cosine decay to 1 % of the learning rate at max_steps)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
+		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -384,6 +398,7 @@ def TrainFundamentalFormPredictor(
 		seed=seed,
 		knn_blend=knn_blend,
 		clip=clip,
+		eikonal_weight=eikonal_weight,
 	)
 
 	# Load pretrained model if specified ('random' or None: keep the fresh initialization)
@@ -1023,6 +1038,7 @@ def parse_args(argv=None):
 		default='authors',
 		help="authors: cosine decay over 1e8 steps (constant in practice); cosine: decay to 1 %% of the lr over each phase's steps",
 	)
+	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
 	ap.add_argument(
@@ -1057,6 +1073,7 @@ def main(argv=None):
 		schedule=a.schedule,
 		clip=a.clip,
 		weight_decay=a.weight_decay,
+		eikonal_weight=a.eik_w,
 	)
 
 
