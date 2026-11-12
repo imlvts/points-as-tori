@@ -1224,6 +1224,44 @@ def train(
 			print('\n'.join(lines) + f'\n[gate] {name}: {"all checks pass" if passed else "some checks MISS"}', flush=True)
 
 
+# Presets: defaults for a whole recipe; flags given on the command line override them (--phase replaces the
+# preset's phase list).
+PRESETS = {
+	# Our L13 run (2026-11-08): phase 1 = nicely sampled blobs + ABC, 150k steps from a fresh initialization; phase 2 =
+	# the same + the simulated scans (at least 128 points), 70k steps from phase 1. Multi-shape patch batches (8 shapes
+	# x 32 centres, union 256), the 32-NN blend of inference, fresh resampling (1024-8192 points) of the nice shapes and
+	# a random rotation at every visit; AdamW lr 1e-5, 1000 warmup steps, cosine decay to 1 %, gradient clip 1,
+	# weight decay 0; loss = L1 distance + 0.1 L1 eikonality; seed 1; gate after each phase. About 13.5 h on an
+	# RTX 4080 (0.21 s/step).
+	'l13': dict(
+		phase=[
+			'p1:nice/blobs_train_mode0_*.npz,nice/ABC*_train_mode0_*.npz:150000',
+			'p2:nice/blobs_train_mode0_*.npz,nice/ABC*_train_mode0_*.npz,simulated/blobs_train_mode-1_*.npz,'
+			'simulated/ABC*_train_mode-1_*.npz:70000',
+		],
+		init='random',
+		lr=1e-5,
+		warmup=1000,
+		schedule='cosine',
+		clip=1.0,
+		weight_decay=0.0,
+		eik_w=0.1,
+		knn_blend=32,
+		multishape=8,
+		patch_c=32,
+		upad=256,
+		resample='1024:8192',
+		resample_match='nice/',
+		rotate=True,
+		min_points=128,
+		seed=1,
+		save_every=10000,
+		log_every=500,
+		gate=True,
+	),
+}
+
+
 def parse_args(argv=None):
 	ap = argparse.ArgumentParser(
 		description='Train the Points-as-Tori fundamental-form predictor. With no options this runs the curriculum of '
@@ -1234,11 +1272,17 @@ def parse_args(argv=None):
 	ap.add_argument(
 		'--validation-file', default=None, help='validation data (default: DATA_DIR/ABC17_validation_3.npz)'
 	)
+	ap.add_argument(
+		'--preset',
+		choices=sorted(PRESETS),
+		default=None,
+		help='defaults of a whole recipe (l13: our L13 run, see PRESETS); explicit flags override them',
+	)
 	ap.add_argument('--seed', type=int, default=42)
 	ap.add_argument(
 		'--phase',
 		action='append',
-		default=[],
+		default=None,
 		metavar='NAME:GLOBS:STEPS',
 		help='run this phase instead of the authors\' curriculum (repeatable, in order); GLOBS: comma-separated file '
 		'patterns relative to --data-dir; each phase starts from the previous one',
@@ -1328,7 +1372,13 @@ def parse_args(argv=None):
 		default=0,
 		help='blend the tori over the K nearest points of each query, as the accelerated inference does (0: all points)',
 	)
-	return ap.parse_args(argv)
+	preset = ap.parse_known_args(argv)[0].preset
+	if preset:
+		ap.set_defaults(**{k: v for k, v in PRESETS[preset].items() if k != 'phase'})
+	a = ap.parse_args(argv)
+	if a.phase is None:
+		a.phase = list(PRESETS[preset]['phase']) if preset else []
+	return a
 
 
 def main(argv=None):
