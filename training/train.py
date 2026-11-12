@@ -207,9 +207,11 @@ def FundamentalFormPredictorTrainer(
 	total_steps=100000,
 	seed=42,
 	knn_blend=0,
+	clip=0.0,
 ):
 	"""
 	Set up network (model) with the given parameters.
+	clip: clip the gradient to this global norm before the AdamW update (0: no clipping)
 
 	Returns: (model, optimizer, train_step) where train_step() is a function that trains the model for a single step.
 	"""
@@ -236,7 +238,7 @@ def FundamentalFormPredictorTrainer(
 	optimizer = nnx.Optimizer(
 		model,
 		optax.chain(
-			# optax.clip_by_global_norm(1.0),
+			*([optax.clip_by_global_norm(clip)] if clip > 0 else []),
 			optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
 		),
 		wrt=nnx.Param,
@@ -314,6 +316,8 @@ def TrainFundamentalFormPredictor(
 	knn_blend=0,
 	min_points=0,
 	schedule='authors',
+	clip=0.0,
+	weight_decay=0.0,
 ):
 	"""
 	Args:
@@ -327,6 +331,8 @@ def TrainFundamentalFormPredictor(
 		min_points: drop training shapes with fewer valid points (0: keep all)
 		schedule: 'authors' (linear warmup, then cosine decay over 1e8 steps, i.e. constant in practice) or 'cosine'
 			(linear warmup, then cosine decay to 1 % of the learning rate at max_steps)
+		clip: clip the gradient to this global norm (0: off)
+		weight_decay: AdamW weight decay
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -354,7 +360,6 @@ def TrainFundamentalFormPredictor(
 
 	# Learning parameters
 	dropout_rate = 0.0
-	weight_decay = 0.0
 	if schedule == 'authors':
 		total_steps = 1e8
 	elif schedule == 'cosine':
@@ -378,6 +383,7 @@ def TrainFundamentalFormPredictor(
 		total_steps=total_steps,
 		seed=seed,
 		knn_blend=knn_blend,
+		clip=clip,
 	)
 
 	# Load pretrained model if specified ('random' or None: keep the fresh initialization)
@@ -1017,6 +1023,8 @@ def parse_args(argv=None):
 		default='authors',
 		help="authors: cosine decay over 1e8 steps (constant in practice); cosine: decay to 1 %% of the lr over each phase's steps",
 	)
+	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
+	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
 	ap.add_argument(
 		'--min-points', type=int, default=0, help='drop training shapes with fewer valid points (0: keep all)'
 	)
@@ -1047,6 +1055,8 @@ def main(argv=None):
 		learning_rate=a.lr,
 		warmup_steps=a.warmup,
 		schedule=a.schedule,
+		clip=a.clip,
+		weight_decay=a.weight_decay,
 	)
 
 
