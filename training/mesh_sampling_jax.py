@@ -684,9 +684,8 @@ def generate_queries_for_neighborhood(
 
 
 @partial(jit, static_argnames=['n_queries', 'use_unsigned_distance'])
-def generate_shape_features(
-	positions: jax.Array,  # (n_points, 3)
-	neighbors: jax.Array,  # (n_points, k) - neighbor indices
+def generate_neighborhood_features(
+	neighbor_positions: jax.Array,  # (n_neighborhoods, k, 3)
 	vertices: jax.Array,  # (max_vertices, 3)
 	faces: jax.Array,  # (max_faces, 3)
 	face_mask: jax.Array,  # (max_faces,)
@@ -697,11 +696,10 @@ def generate_shape_features(
 	use_unsigned_distance: bool = False,
 ) -> Tuple[jax.Array, jax.Array]:
 	"""
-	Generate query points and ground-truth distances for all neighborhoods in a shape.
+	Generate query points and ground-truth distances for the given neighborhoods (point positions of each).
 
 	Args:
-		positions: Point cloud positions
-		neighbors: Neighbor indices for each point
+		neighbor_positions: The points of each neighborhood
 		vertices: Mesh vertices (padded to max_vertices)
 		faces: Mesh faces (padded to max_faces, invalid = -1)
 		face_mask: Boolean mask for valid faces
@@ -711,17 +709,16 @@ def generate_shape_features(
 		bbox_extension: Extension factor
 
 	Returns:
-		queries: (n_points, n_queries, 3) query points per neighborhood
-		distances: (n_points, n_queries) ground-truth signed distances
+		queries: (n_neighborhoods, n_queries, 3) query points per neighborhood
+		distances: (n_neighborhoods, n_queries) ground-truth signed distances
 	"""
-	n_points = positions.shape[0]
+	n_points = neighbor_positions.shape[0]
 	n_queries_per_type = n_queries // 3
 
 	# Pre-compute face properties (once for entire shape)
 	face_normals, face_areas, _ = compute_face_properties(vertices, faces, face_mask)
 
 	# Compute bboxes for all neighborhoods
-	neighbor_positions = positions[neighbors]  # (n_points, k, 3)
 	bbox_mins = jnp.min(neighbor_positions, axis=1)  # (n_points, 3)
 	bbox_maxs = jnp.max(neighbor_positions, axis=1)
 
@@ -757,3 +754,37 @@ def generate_shape_features(
 	distances = jax.vmap(compute_distances_for_point)(queries)  # (n_points, n_queries)
 
 	return queries, distances
+
+
+@partial(jit, static_argnames=['n_queries', 'use_unsigned_distance'])
+def generate_shape_features(
+	positions: jax.Array,  # (n_points, 3)
+	neighbors: jax.Array,  # (n_points, k) - neighbor indices
+	vertices: jax.Array,  # (max_vertices, 3)
+	faces: jax.Array,  # (max_faces, 3)
+	face_mask: jax.Array,  # (max_faces,)
+	key: jax.random.PRNGKey,
+	n_queries: int = 120,
+	narrow_band_offset: float = 0.2,
+	bbox_extension: float = 1.0,
+	use_unsigned_distance: bool = False,
+) -> Tuple[jax.Array, jax.Array]:
+	"""
+	Generate query points and ground-truth distances for all neighborhoods in a shape
+	(generate_neighborhood_features of positions[neighbors]).
+
+	Returns:
+		queries: (n_points, n_queries, 3) query points per neighborhood
+		distances: (n_points, n_queries) ground-truth signed distances
+	"""
+	return generate_neighborhood_features(
+		positions[neighbors],
+		vertices,
+		faces,
+		face_mask,
+		key,
+		n_queries=n_queries,
+		narrow_band_offset=narrow_band_offset,
+		bbox_extension=bbox_extension,
+		use_unsigned_distance=use_unsigned_distance,
+	)

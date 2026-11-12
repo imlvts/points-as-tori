@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 
 import matplotlib.pyplot as plt
 
@@ -6,6 +7,7 @@ from pointsastori.shape_3d import *
 from pointsastori.network import *
 from mesh_data import *
 from mesh_sampling_jax import *
+import augment
 
 
 def sanitize_neighbors(neighbors):
@@ -310,6 +312,47 @@ def FundamentalFormPredictorTrainer(
 	return model, optimizer, train_step
 
 
+# ========================================================================
+# MULTI-SHAPE PATCH BATCHES (--multishape)
+# ========================================================================
+
+
+def make_patch_step(knn_blend=0, eikonal_weight=1.0):
+	"""
+	Train step on S patches (augment.make_patch), one per shape: the network runs on the patch unions, and SDF_loss is
+	evaluated per patch (tori and blend restricted to the union) on the queries of the patch centres; the loss is the
+	mean over the patches.
+	"""
+
+	@nnx.jit
+	def patch_step(model, optimizer, UP, UN, Upos, Unrm, Umask, queries, true_distances):
+		"""
+		UP, UN: (S, U, k, 3) neighborhoods of the union points; Upos, Unrm: (S, U, 3); Umask: (S, U);
+		queries: (S, C, n_queries, 3); true_distances: (S, C, n_queries)
+		"""
+		S, U, K, _ = UP.shape
+		batch_mask = jnp.ones(queries.shape[1], bool)
+
+		def loss_fn(model):
+			coefficients = model(UP.reshape(S * U, K, 3), UN.reshape(S * U, K, 3)).reshape(S, U, 6)
+			_, loss_dict = jax.vmap(
+				lambda m, p, n, c, q, d: SDF_loss(
+					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight
+				)
+			)(Umask, Upos, Unrm, coefficients, queries, true_distances)
+			distance_loss = jnp.mean(loss_dict['distance_loss'])
+			eikonality_loss = jnp.mean(loss_dict['eikonality_loss'])
+			loss = distance_loss + eikonal_weight * eikonality_loss
+			return loss, {'distance_loss': distance_loss, 'eikonality_loss': eikonality_loss}
+
+		(loss, loss_dict), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+		grads = jax.tree_util.tree_map(lambda x: x if x is None else jnp.where(jnp.isnan(x), 0.0, x), grads)
+		optimizer.update(model, grads)
+		return loss, loss_dict
+
+	return patch_step
+
+
 def TrainFundamentalFormPredictor(
 	training_data_filenames,
 	num_epochs,
@@ -331,6 +374,10 @@ def TrainFundamentalFormPredictor(
 	clip=0.0,
 	weight_decay=0.0,
 	eikonal_weight=1.0,
+	multishape=0,
+	patch_centres=32,
+	union_size=256,
+	save_every=10000,
 ):
 	"""
 	Args:
@@ -347,6 +394,10 @@ def TrainFundamentalFormPredictor(
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
+		multishape: S > 0 trains on multi-shape patch batches instead of the authors' loop: every step takes one patch
+			of patch_centres clustered query centres from each of S shapes (augment.make_patch; union of their k-NN padded
+			to union_size), for max_steps steps; checkpoint and validation every save_every steps. 0: the authors'
+			loop (every step trains on batch_size query rows of one shape).
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -581,6 +632,88 @@ def TrainFundamentalFormPredictor(
 		nnx.train_mode(model)
 		return val_loss, val_eikonality_loss
 
+	def train_on_patches():
+		"""The multi-shape patch loop (multishape > 0); batches are prepared on the CPU one step ahead."""
+		if not max_steps:
+			raise ValueError('multi-shape patch batches need the number of steps of the phase (max_steps)')
+		patch_step = make_patch_step(knn_blend, eikonal_weight)
+		rng = np.random.default_rng(seed + 1000)
+		stream = []
+
+		def next_shapes():
+			nonlocal stream
+			while len(stream) < multishape:
+				stream += list(np.random.permutation(total_shapes))
+			out, stream = stream[:multishape], stream[multishape:]
+			return out
+
+		def prepare(global_indices):
+			patches = []
+			for g in global_indices:
+				dataset_idx, shape_idx = all_shape_indices[g]
+				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
+				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors)
+				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
+				patches.append(patch + (V, F, FM))
+			return patches
+
+		pool = concurrent.futures.ThreadPoolExecutor(1)
+		future = pool.submit(prepare, next_shapes())
+		step, log_buffer, union_sizes, t_log = 0, [], [], time.time()
+		while step < max_steps:
+			patches = future.result()
+			future = pool.submit(prepare, next_shapes())
+			step_key = jax.random.fold_in(key, step)
+			queries, distances = [], []
+			for j, pt in enumerate(patches):
+				q, d = generate_neighborhood_features(
+					jnp.asarray(pt[5]),
+					jnp.asarray(pt[7], jnp.float32),
+					jnp.asarray(pt[8]),
+					jnp.asarray(pt[9]),
+					jax.random.fold_in(step_key, j),
+					n_queries=n_queries_per_neighborhood,
+					narrow_band_offset=narrow_band_offset,
+					bbox_extension=bbox_extension,
+				)
+				queries.append(q)
+				distances.append(d)
+				union_sizes.append(pt[6])
+			stack = lambda i: jnp.asarray(np.stack([pt[i] for pt in patches]))  # noqa: E731
+			loss, loss_dict = patch_step(
+				model, optimizer, stack(0), stack(1), stack(2), stack(3), stack(4), jnp.stack(queries), jnp.stack(distances)
+			)
+			step += 1
+			log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss']))
+			if (log_every and step % log_every == 0) or step == max_steps:
+				v = np.array([[float(x) for x in r] for r in log_buffer])
+				now = time.time()
+				print(
+					f'[step] {step} loss {v[:, 0].mean():.8f} distance {v[:, 1].mean():.8f} eikonality {v[:, 2].mean():.8f} '
+					f'{(now - t_log) / len(v):.3f} s/step union mean {np.mean(union_sizes):.0f} max {np.max(union_sizes)}',
+					flush=True,
+				)
+				if not np.all(np.isfinite(v)):
+					raise FloatingPointError(f'non-finite loss at step {step}')
+				all_train_losses.append(v[:, 0].mean())
+				all_distance_losses.append(v[:, 1].mean())
+				all_eikonality_losses.append(v[:, 2].mean())
+				log_buffer, union_sizes, t_log = [], [], now
+			if save_every and step % save_every == 0 and step < max_steps:
+				save_model(model, f'step{step}')
+				if val_positions is not None:
+					val_loss, val_eikonality_loss = run_validation(jax.random.fold_in(key, 0))
+					print(f'	{"validation:":<{LABEL_WIDTH}}{val_loss:<{VALUE_WIDTH}.6f}'
+						f'{"eikonality:":<{LABEL_WIDTH}}{val_eikonality_loss:<{VALUE_WIDTH}.6f}', flush=True)
+					nnx.train_mode(model)
+		pool.shutdown()
+		if val_positions is not None:
+			val_loss, val_eikonality_loss = run_validation(jax.random.fold_in(key, 0))
+			validation_losses.append(val_loss)
+			validation_epochs.append(len(all_train_losses) - 1)
+			print(f'	{"validation:":<{LABEL_WIDTH}}{val_loss:<{VALUE_WIDTH}.6f}'
+				f'{"eikonality:":<{LABEL_WIDTH}}{val_eikonality_loss:<{VALUE_WIDTH}.6f}', flush=True)
+
 	# Training loop
 	nnx.train_mode(model)
 
@@ -603,7 +736,11 @@ def TrainFundamentalFormPredictor(
 	t_log = time.time()
 	stop = False
 
-	for epoch in range(num_epochs):
+	if multishape:
+		train_on_patches()
+
+	# The authors' loop: every step trains on batch_size query rows of one shape (not used with multishape)
+	for epoch in range(0 if multishape else num_epochs):
 		epoch_key = jax.random.fold_in(key, epoch)  # deterministic key per epoch
 
 		epoch_losses = []
@@ -1038,6 +1175,19 @@ def parse_args(argv=None):
 		default='authors',
 		help="authors: cosine decay over 1e8 steps (constant in practice); cosine: decay to 1 %% of the lr over each phase's steps",
 	)
+	ap.add_argument(
+		'--multishape',
+		type=int,
+		default=0,
+		metavar='S',
+		help='train on multi-shape patch batches: one patch of --patch-c clustered centres from each of S shapes per step '
+		'(needs a step count: --phase ...:STEPS or --max-steps; 0: the authors\' one-shape batches)',
+	)
+	ap.add_argument('--patch-c', type=int, default=32, help='query centres per patch (--multishape)')
+	ap.add_argument('--upad', type=int, default=256, help='patch union size, padded (--multishape)')
+	ap.add_argument(
+		'--save-every', type=int, default=10000, help='checkpoint and validation every N steps (--multishape; 0: at the end)'
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1074,6 +1224,10 @@ def main(argv=None):
 		clip=a.clip,
 		weight_decay=a.weight_decay,
 		eikonal_weight=a.eik_w,
+		multishape=a.multishape,
+		patch_centres=a.patch_c,
+		union_size=a.upad,
+		save_every=a.save_every,
 	)
 
 
