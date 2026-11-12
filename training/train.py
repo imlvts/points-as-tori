@@ -378,6 +378,8 @@ def TrainFundamentalFormPredictor(
 	patch_centres=32,
 	union_size=256,
 	save_every=10000,
+	resample='',
+	resample_match='',
 ):
 	"""
 	Args:
@@ -398,6 +400,9 @@ def TrainFundamentalFormPredictor(
 			of patch_centres clustered query centres from each of S shapes (augment.make_patch; union of their k-NN padded
 			to union_size), for max_steps steps; checkpoint and validation every save_every steps. 0: the authors'
 			loop (every step trains on batch_size query rows of one shape).
+		resample: 'LO:HI' with multishape: every visit of a shape draws fresh points on its ground-truth mesh, their count
+			uniform among the powers of two in [LO, HI], and recomputes the k-NN ('': the stored points)
+		resample_match: resample only shapes whose data file path contains this string ('': all)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -507,6 +512,8 @@ def TrainFundamentalFormPredictor(
 			all_shape_indices.append((dataset_idx, shape_idx))
 
 	total_shapes = len(all_shape_indices)
+	if resample and not multishape:
+		raise ValueError('resample needs multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -652,7 +659,8 @@ def TrainFundamentalFormPredictor(
 			for g in global_indices:
 				dataset_idx, shape_idx = all_shape_indices[g]
 				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
-				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors)
+				shape_resample = resample if (resample and resample_match in training_data_filenames[dataset_idx]) else ''
+				P, N, NB, M, V, F, FM, tree = augment.visit(arrays, k_neighbors, rng, shape_resample)
 				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
 				patches.append(patch + (V, F, FM))
 			return patches
@@ -1188,6 +1196,16 @@ def parse_args(argv=None):
 	ap.add_argument(
 		'--save-every', type=int, default=10000, help='checkpoint and validation every N steps (--multishape; 0: at the end)'
 	)
+	ap.add_argument(
+		'--resample',
+		default='',
+		metavar='MIN:MAX',
+		help='with --multishape: fresh points on the ground-truth mesh at every visit, count uniform among the powers of two '
+		'in [MIN, MAX], k-NN recomputed (default: the stored points)',
+	)
+	ap.add_argument(
+		'--resample-match', default='', help='resample only shapes whose data file path contains this string (default: all)'
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1228,6 +1246,8 @@ def main(argv=None):
 		patch_centres=a.patch_c,
 		union_size=a.upad,
 		save_every=a.save_every,
+		resample=a.resample,
+		resample_match=a.resample_match,
 	)
 
 
