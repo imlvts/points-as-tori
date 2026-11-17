@@ -236,11 +236,14 @@ def FundamentalFormPredictorTrainer(
 	knn_blend=0,
 	clip=0.0,
 	eikonal_weight=1.0,
+	schedule_fn=None,
 ):
 	"""
 	Set up network (model) with the given parameters.
 	eikonal_weight: weight of the eikonality term of the loss
 	clip: clip the gradient to this global norm before the AdamW update (0: no clipping)
+	schedule_fn: learning rate as a function of the optimizer step count (None: linear warmup, then cosine decay to 1 %
+		over total_steps)
 
 	Returns: (model, optimizer, train_step) where train_step() is a function that trains the model for a single step.
 	"""
@@ -262,6 +265,8 @@ def FundamentalFormPredictorTrainer(
 		decay_steps=total_steps,  # Cosine decay over this many steps
 		end_value=learning_rate * 0.01,
 	)
+	if schedule_fn is not None:
+		schedule = schedule_fn
 
 	# Optimizer
 	optimizer = nnx.Optimizer(
@@ -464,6 +469,9 @@ def TrainFundamentalFormPredictor(
 	normal_band=False,
 	lipschitz_cube=False,
 	aux_curv=0.0,
+	wsd_decay=0.2,
+	schedule_offset=0,
+	schedule_total=0,
 ):
 	"""
 	Args:
@@ -475,8 +483,13 @@ def TrainFundamentalFormPredictor(
 		log_every: print the mean loss of the last log_every steps (0: off)
 		knn_blend: train (and validate) with the blend over the K nearest points of each query (0: all points)
 		min_points: drop training shapes with fewer valid points (0: keep all)
-		schedule: 'authors' (linear warmup, then cosine decay over 1e8 steps, i.e. constant in practice) or 'cosine'
-			(linear warmup, then cosine decay to 1 % of the learning rate at max_steps)
+		schedule: 'authors' (linear warmup, then cosine decay over 1e8 steps, i.e. constant in practice), 'cosine'
+			(linear warmup, then cosine decay to 1 % of the learning rate at max_steps) or 'wsd' (warmup-stable-decay
+			over the whole curriculum: global step t = schedule_offset + the phase's step; lr constant until
+			(1 - wsd_decay) schedule_total, then cosine decay to 1 % at schedule_total; every phase whose optimizer
+			starts fresh has a linear warmup over warmup_steps)
+		wsd_decay: the fraction of the curriculum's steps in the final decay of the 'wsd' schedule
+		schedule_offset, schedule_total: steps of the curriculum before this phase, and in all (set by train())
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -546,8 +559,22 @@ def TrainFundamentalFormPredictor(
 		if not max_steps:
 			raise ValueError("schedule 'cosine' needs the number of steps of the phase (max_steps)")
 		total_steps = max_steps
+	elif schedule == 'wsd':
+		if not schedule_total:
+			raise ValueError("schedule 'wsd' needs the step counts of all phases (--phase NAME:GLOBS:STEPS)")
+		total_steps = schedule_total
 	else:
 		raise ValueError(f'unknown schedule {schedule!r}')
+	schedule_fn = None
+	if schedule == 'wsd':
+		decay_start = schedule_total * (1.0 - wsd_decay)
+
+		def schedule_fn(count, warm=float(warmup_steps), offset=float(schedule_offset)):
+			local = jnp.asarray(count, jnp.float32)
+			t = offset + local
+			warmup_factor = jnp.minimum(1.0, local / warm) if warm > 0 else 1.0
+			frac = jnp.clip((t - decay_start) / max(schedule_total - decay_start, 1.0), 0.0, 1.0)
+			return learning_rate * warmup_factor * (0.01 + 0.99 * 0.5 * (1.0 + jnp.cos(jnp.pi * frac)))
 
 	model, optimizer, train_step = FundamentalFormPredictorTrainer(
 		embed_dim=embed_dim,
@@ -565,6 +592,7 @@ def TrainFundamentalFormPredictor(
 		knn_blend=knn_blend,
 		clip=clip,
 		eikonal_weight=eikonal_weight,
+		schedule_fn=schedule_fn,
 	)
 
 	# Load pretrained model if specified ('random' or None: keep the fresh initialization)
@@ -1351,7 +1379,14 @@ def train(
 			phases[0]['load_model_path'] = None
 	if only_phases:
 		phases = [ph for ph in phases if ph['name'] in only_phases]
+	if options.get('schedule') == 'wsd':  # one schedule over all phases: their step counts
+		counts = [min(x for x in (ph.get('max_steps', 0), max_steps) if x) if (ph.get('max_steps', 0) or max_steps) else 0 for ph in phases]
+		if not all(counts):
+			raise ValueError("--schedule wsd needs a step count for every phase (--phase NAME:GLOBS:STEPS or --max-steps)")
+		offsets = np.cumsum([0] + counts)
 	for i, phase in enumerate(phases):
+		if options.get('schedule') == 'wsd':
+			options = dict(options, schedule_offset=int(offsets[i]), schedule_total=int(offsets[-1]))
 		name = phase.pop('name')
 		if i == 0 and init is not None:
 			phase['load_model_path'] = init
@@ -1462,9 +1497,18 @@ def parse_args(argv=None):
 	ap.add_argument('--warmup', type=int, default=None, help="linear warmup steps of every phase (default: the curriculum's)")
 	ap.add_argument(
 		'--schedule',
-		choices=['authors', 'cosine'],
+		choices=['authors', 'cosine', 'wsd'],
 		default='authors',
-		help="authors: cosine decay over 1e8 steps (constant in practice); cosine: decay to 1 %% of the lr over each phase's steps",
+		help="authors: cosine decay over 1e8 steps (constant in practice); cosine: decay to 1 %% of the lr over each phase's steps; "
+		'wsd: warmup-stable-decay over all phases (constant lr, cosine decay to 1 %% over the last --wsd-decay of all steps; '
+		'a phase with a fresh optimizer warms up over --warmup steps)',
+	)
+	ap.add_argument(
+		'--wsd-decay',
+		type=float,
+		default=0.2,
+		metavar='F',
+		help='--schedule wsd: fraction of all steps in the final decay (the stable part is the rest; default 0.2)',
 	)
 	ap.add_argument(
 		'--multishape',
@@ -1621,6 +1665,7 @@ def main(argv=None):
 		normal_band=a.normal_band,
 		lipschitz_cube=a.lipschitz_cube,
 		aux_curv=a.aux_curv,
+		wsd_decay=a.wsd_decay,
 	)
 
 
