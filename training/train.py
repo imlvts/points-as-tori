@@ -1378,11 +1378,13 @@ def parse_args(argv=None):
 	)
 	ap.add_argument(
 		'--frame',
-		choices=['legacy', 'continuous'],
+		choices=['legacy', 'continuous', 'invariant'],
 		default='legacy',
 		help="architecture: tangent frame of the network input. legacy: the authors' (jumps at |n_x| = 0.9); continuous: "
-		"Frisvad's frame, continuous except at one direction; the prediction is rotated into the legacy frame, so the "
-		'torus fits (and the C++ inference) are unchanged. Saved with the model',
+		"Frisvad's frame, continuous except at one direction; invariant: weighted average of the predictions in 3 frames "
+		'attached to the neighbourhood (moments of the tangent offsets), exactly frame- and rotation-invariant and '
+		'continuous, 3x the network cost. The prediction is rotated into the legacy frame, so the torus fits (and the '
+		'C++ inference) are unchanged. Saved with the model',
 	)
 	ap.add_argument(
 		'--knn-blend',

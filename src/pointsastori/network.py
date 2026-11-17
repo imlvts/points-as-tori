@@ -128,6 +128,37 @@ def continuous_frame(n: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
 	return s, t
 
 
+def invariant_frames(positions: jnp.ndarray, s_hat: jnp.ndarray, t_hat: jnp.ndarray):
+	"""
+	Frames of the weighted frame averaging of FundamentalFormPredictor frame='invariant' (Dym, Lawrence, Siegel 2024,
+	"Equivariant frame averaging"; continuous canonicalization is impossible, weighted averaging over a small
+	equivariant frame set is not). With z_j = s_j + i t_j the tangent coordinates of the neighbours relative to the
+	centre in a base frame (s_hat, t_hat) ([batch, 1, 3]), the spin-1 and spin-2 moments m1 = sum z_j, m2 = sum z_j^2
+	rotate with the frame, so the three frames at angles arg m1, arg(m2)/2, arg(m2)/2 + pi (relative to the base frame)
+	are attached to the neighbourhood, not to the base frame. Weights (sum 1): |m1|^2 / (sum |z_j|)^2 for the first,
+	|m2|^2 / (sum |z_j|^2)^2 / 2 for each of the others, i.e. a frame counts in proportion to how well its moment
+	determines it, and an ill-determined angle (moment -> 0) has weight -> 0: the average is continuous in the input
+	and exactly invariant to the base frame. (Only if both moments vanish exactly the weights fall back to equal
+	weights of frames that are then not determined by the neighbourhood.)
+
+	Returns: angles [batch, 3] (relative to the base frame), weights [batch, 3].
+	"""
+	d = positions - positions[:, 0:1, :]
+	x = jnp.sum(d * s_hat, axis=-1)  # [batch, k]
+	y = jnp.sum(d * t_hat, axis=-1)
+	r2 = x * x + y * y
+	m1x, m1y = jnp.sum(x, axis=-1), jnp.sum(y, axis=-1)
+	m2x, m2y = jnp.sum(x * x - y * y, axis=-1), jnp.sum(2 * x * y, axis=-1)
+	tiny = 1e-30
+	w1 = (m1x * m1x + m1y * m1y) / jnp.maximum(jnp.sum(jnp.sqrt(r2), axis=-1) ** 2, tiny)
+	w2 = (m2x * m2x + m2y * m2y) / jnp.maximum(jnp.sum(r2, axis=-1) ** 2, tiny)
+	th1 = jnp.arctan2(m1y, m1x)
+	th2 = 0.5 * jnp.arctan2(m2y, m2x)
+	angles = jnp.stack([th1, th2, th2 + jnp.pi], axis=-1)
+	weights = jnp.stack([w1, 0.5 * w2, 0.5 * w2], axis=-1) + 1e-12
+	return angles, weights / jnp.sum(weights, axis=-1, keepdims=True)
+
+
 def rotate_coeffs(c: jnp.ndarray, cos_phi: jnp.ndarray, sin_phi: jnp.ndarray) -> jnp.ndarray:
 	"""
 	Coefficients (a00, a01, a10, a11, a02, a20) of the height h = a00 + a10 s' + a01 t' + a20 s'^2 + a11 s' t' + a02 t'^2
@@ -1149,9 +1180,9 @@ class InputFeatures(nnx.Module):
 
 # Architecture options of FundamentalFormPredictor (train.py flags; saved with the weights). The defaults are the
 # authors' network.
-FRAMES = ('legacy', 'continuous')
+FRAMES = ('legacy', 'continuous', 'invariant')
 ARCH_DEFAULTS = dict(
-	frame='legacy',  # tangent frame of the input features (see continuous_frame)
+	frame='legacy',  # tangent frame of the input features (see continuous_frame, invariant_frames)
 )
 
 
@@ -1267,6 +1298,17 @@ class FundamentalFormPredictor(nnx.Module):
 		n0 = normals[:, 0:1, :]
 		n0 = n0 / jnp.maximum(jnp.linalg.norm(n0, axis=-1, keepdims=True), NAN_EPSILON)
 		s_leg, t_leg = orthonormal_basis_with_rotation(n0, 0.0)
+		if self.arch['frame'] == 'invariant':
+			batch = positions.shape[0]
+			angles, weights = invariant_frames(positions, s_leg, t_leg)  # [batch, F]
+			n_frames = angles.shape[1]
+			co, si = jnp.cos(angles).T.reshape(-1), jnp.sin(angles).T.reshape(-1)  # frame-major [F * batch]
+			s_rep, t_rep = jnp.tile(s_leg, (n_frames, 1, 1)), jnp.tile(t_leg, (n_frames, 1, 1))
+			s_hat = co[:, None, None] * s_rep + si[:, None, None] * t_rep
+			t_hat = -si[:, None, None] * s_rep + co[:, None, None] * t_rep
+			c = self._forward_in_frame(jnp.tile(positions, (n_frames, 1, 1)), jnp.tile(normals, (n_frames, 1, 1)), s_hat, t_hat)
+			c = rotate_coeffs(c, co, si).reshape(n_frames, batch, 6)
+			return jnp.einsum('fb,fbc->bc', weights.T, c), None
 		if self.arch['frame'] == 'continuous':
 			s_hat, t_hat = continuous_frame(n0)
 		else:
