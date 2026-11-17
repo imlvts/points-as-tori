@@ -1100,12 +1100,34 @@ class TransformerBlock(nnx.Module):
 		return x
 
 
+GEOMETRIC_INPUT_DIM = 13
+SECANT_EPS = 0.05  # (in units of the neighbourhood's median distance) regularizes the secant curvatures near the centre
+
+
+def geometric_input_features(coordinates, local_normals):
+	"""
+	--input-mlp features of each neighbour from its local coordinates (s, t, h) and local normal (n_s, n_t, n_z), all in
+	units of the neighbourhood's median distance: [s, t, h, n_s, n_t, n_z, r, rho, s^2, s t, t^2, 2 h / (rho^2 + eps),
+	-(s n_s + t n_t) / (rho^2 + eps)] with r = |(s, t, h)|, rho = |(s, t)|; the last two are the secant normal
+	curvature of the neighbour seen from the centre, from its height and from its normal (0 at the centre).
+	"""
+	s, t, h = coordinates[..., 0], coordinates[..., 1], coordinates[..., 2]
+	ns, nt, nz = local_normals[..., 0], local_normals[..., 1], local_normals[..., 2]
+	rho2 = s * s + t * t
+	r = jnp.sqrt(rho2 + h * h + 1e-12)
+	rho = jnp.sqrt(rho2 + 1e-12)
+	inv = 1.0 / (rho2 + SECANT_EPS)
+	return jnp.stack(
+		[s, t, h, ns, nt, nz, r, rho, s * s, s * t, t * t, 2.0 * h * inv, -(s * ns + t * nt) * inv], axis=-1
+	)
+
+
 class InputFeatures(nnx.Module):
 	"""
 	Turn a neighborhood (point positions & their normals) to the input features to be fed into the neural network.
 	"""
 
-	def __init__(self, output_dim: int, n_freq: int = 0, *, rngs: nnx.Rngs):
+	def __init__(self, output_dim: int, n_freq: int = 0, input_mlp: bool = False, *, rngs: nnx.Rngs):
 		# Input features: local coordinates (3), normals in local coordinates (3)
 		input_dim = 6
 
@@ -1119,6 +1141,15 @@ class InputFeatures(nnx.Module):
 			nnx.Linear(input_dim, output_dim, rngs=rngs),
 			nnx.LayerNorm(output_dim, rngs=rngs),  # LayerNorm seems to really help here
 		)
+		self.input_mlp = input_mlp
+		if input_mlp:
+			# --input-mlp: the 13 geometric features of geometric_input_features through a 2-layer GELU MLP
+			self.mlp = nnx.Sequential(
+				nnx.Linear(GEOMETRIC_INPUT_DIM, output_dim, rngs=rngs),
+				nnx.gelu,
+				nnx.Linear(output_dim, output_dim, rngs=rngs),
+				nnx.LayerNorm(output_dim, rngs=rngs),
+			)
 
 		self.key = jax.random.PRNGKey(57)
 
@@ -1174,6 +1205,8 @@ class InputFeatures(nnx.Module):
 
 		# [local coordinates (3), normals in local coordinates (3)]
 		geometric_features = jnp.concatenate([coordinates, local_normals], axis=-1)  # [batch, k, input_dim]
+		if self.input_mlp:
+			geometric_features = geometric_input_features(coordinates, local_normals)
 
 		return self.mlp(geometric_features), median
 
@@ -1183,6 +1216,7 @@ class InputFeatures(nnx.Module):
 FRAMES = ('legacy', 'continuous', 'invariant')
 ARCH_DEFAULTS = dict(
 	frame='legacy',  # tangent frame of the input features (see continuous_frame, invariant_frames)
+	input_mlp=False,  # geometric input features through a 2-layer MLP (geometric_input_features)
 )
 
 
@@ -1213,7 +1247,7 @@ class FundamentalFormPredictor(nnx.Module):
 			raise ValueError(f"frame {self.arch['frame']!r}: expected one of {FRAMES}")
 		self.extended = self.arch != ARCH_DEFAULTS
 
-		self.input_encoder = InputFeatures(embed_dim, n_freq=n_freq, rngs=rngs)
+		self.input_encoder = InputFeatures(embed_dim, n_freq=n_freq, input_mlp=self.arch['input_mlp'], rngs=rngs)
 
 		self.blocks = nnx.List(
 			[TransformerBlock(embed_dim, n_heads, mlp_dim, dropout_rate, rngs=rngs) for _ in range(n_layers)]

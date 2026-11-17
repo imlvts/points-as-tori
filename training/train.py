@@ -1387,6 +1387,13 @@ def parse_args(argv=None):
 		'C++ inference) are unchanged. Saved with the model',
 	)
 	ap.add_argument(
+		'--input-mlp',
+		action='store_true',
+		help='architecture: encode each neighbour by 13 geometric features (local coordinates and normal, distances, '
+		's^2, st, t^2, secant curvatures from height and normal) through a 2-layer GELU MLP instead of one linear layer '
+		'on the 6 raw ones. Saved with the model',
+	)
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1439,7 +1446,7 @@ def main(argv=None):
 
 def arch_options(a):
 	"""The architecture options of the command line that differ from the authors' network (network.ARCH_DEFAULTS)."""
-	opts = dict(frame=a.frame)
+	opts = dict(frame=a.frame, input_mlp=a.input_mlp)
 	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k]}
 
 
