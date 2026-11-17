@@ -1031,6 +1031,25 @@ class TransformerBlock(nnx.Module):
 
 		return x
 
+	def call_first_token(self, x: jax.Array) -> jax.Array:
+		"""
+		self(x)[:, :1]: the block's output at token 0 only, [batch, 1, embed_dim]. Token 0 attends to all tokens as
+		before (its query against the keys and values of every token); LayerNorm and the FFN act per token. The same
+		function as self(x)[:, :1] up to rounding, without computing the 63 outputs that are discarded after the last
+		block.
+		"""
+		h = self.norm1(x)
+		h = self.attention(h[:, :1], h, h)
+		h = self.dropout(h)
+		x = x[:, :1] + h
+
+		residual = x
+		x = self.norm2(x)
+		x = self.ffn(x)
+		x = residual + x
+
+		return x
+
 
 class InputFeatures(nnx.Module):
 	"""
@@ -1160,11 +1179,15 @@ class FundamentalFormPredictor(nnx.Module):
 		input_features, scale = self.input_encoder(positions, normals)
 		x = input_features
 
-		# Apply transformer blocks
-		for block in self.blocks:
-			x = block(x)
+		# Apply transformer blocks. Only token 0 (the center point) is read out, so the last block computes its output
+		# at token 0 only (call_first_token).
+		n_blocks = len(self.blocks)
+		for i in range(n_blocks - 1):
+			x = self.blocks[i](x)
+		if n_blocks:
+			x = self.blocks[n_blocks - 1].call_first_token(x)  # [batch, 1, embed_dim]
 
-		x = self.final_norm(x)  # [batch, k, embed_dim]
+		x = self.final_norm(x)  # [batch, 1, embed_dim]
 
 		# Extract center point
 		x = x[:, 0, :]  # [batch, embed_dim]
