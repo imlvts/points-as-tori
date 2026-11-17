@@ -356,9 +356,10 @@ def curvature_aux_loss(coefficients, neighborhoods, target, mask, tilt=True):
 	coefficients: (n, 6) predicted (a00, a01, a10, a11, a02, a20) in world units; neighborhoods: (n, k, 3) the network
 	inputs (row 0 the point; sigma = median distance to it, the network's scale); target: (n, 2) true principal
 	curvatures (k1, k2) in the sign convention of eval_model.curvatures (convex with outward normal < 0); mask: (n,).
-	Per point, in units of sigma: |H sigma - H_t sigma| + |D sigma - D_t sigma| + |a00| / sigma (+ |a01| + |a10| if
-	tilt), H the mean curvature and D = |k1 - k2| / 2 of the quadric (from the shape operator I^-1 II, as in
-	torus_precompute_masked), so the order of k1, k2 does not matter. Mean over the masked points.
+	Per point, in units of sigma: |atan(H sigma) - atan(H_t sigma)| + |atan(D sigma) - atan(D_t sigma)| + |a00| / sigma
+	(+ |a01| + |a10| if tilt), H the mean curvature and D = |k1 - k2| / 2 of the quadric (from the shape operator
+	I^-1 II, as in torus_precompute_masked), so the order of k1, k2 does not matter. atan: L1 for |k sigma| << 1,
+	bounded for the thin tubes and rims (|k sigma| up to 10) that would otherwise dominate. Mean over the masked points.
 	"""
 	a00, a01, a10, a11, a02, a20 = (coefficients[:, i] for i in range(6))
 	sigma = jnp.median(jnp.linalg.norm(neighborhoods - neighborhoods[:, :1], axis=-1), axis=-1)
@@ -372,7 +373,7 @@ def curvature_aux_loss(coefficients, neighborhoods, target, mask, tilt=True):
 	Ds = jnp.sqrt(jnp.maximum(Hs**2 - Ks, 0.0) + 1e-8)
 	Ht = 0.5 * (target[:, 0] + target[:, 1]) * sigma
 	Dt = 0.5 * jnp.abs(target[:, 0] - target[:, 1]) * sigma
-	err = jnp.abs(Hs - Ht) + jnp.abs(Ds - Dt) + jnp.abs(a00) / sigma
+	err = jnp.abs(jnp.arctan(Hs) - jnp.arctan(Ht)) + jnp.abs(jnp.arctan(Ds) - jnp.arctan(Dt)) + jnp.abs(a00) / sigma
 	if tilt:
 		err = err + jnp.abs(a01) + jnp.abs(a10)
 	err = jnp.where(mask & jnp.isfinite(err), err, 0.0)
@@ -1758,7 +1759,7 @@ def parse_args(argv=None):
 		default=0.0,
 		metavar='W',
 		help='with --mix: add W * an L1 loss on the predicted quadrics of all union points of the analytic patches '
-		'(mean curvature and |k1 - k2|/2 in units of 1/sigma, contact offset a00/sigma, tilt a01, a10; exact values from '
+		'(atan of the mean curvature and of |k1 - k2|/2 in units of 1/sigma, contact offset a00/sigma, tilt a01, a10; exact values from '
 		'the analytic scenes) (0: off)',
 	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
