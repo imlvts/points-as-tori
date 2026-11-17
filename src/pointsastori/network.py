@@ -1122,6 +1122,34 @@ def geometric_input_features(coordinates, local_normals):
 	)
 
 
+WLS_RIDGE = 1e-4
+
+
+def weighted_jet_fit(geometry, w_pos, w_nrm):
+	"""
+	--wls: the quadric h = a00 + a10 s + a01 t + a20 s^2 + a11 s t + a02 t^2 of a neighbourhood by weighted least squares
+	on the neighbours' heights (weights w_pos) and normals (weights w_nrm; the normal (n_s, n_t, n_z) of the quadric's
+	graph satisfies n_s + n_z dh/ds = 0, n_t + n_z dh/dt = 0, linear in the coefficients and without division by n_z),
+	with a ridge of WLS_RIDGE times the total weight. Differentiable (a batched 6 x 6 solve).
+
+	geometry: [batch, k, 6] (s, t, h, n_s, n_t, n_z) in units of the median distance; w_pos, w_nrm: [batch, k] >= 0.
+	Returns [batch, 6] coefficients (a00, a01, a10, a11, a02, a20) in the same units.
+	"""
+	s, t, h, ns, nt, nz = [geometry[..., i] for i in range(6)]
+	one, zero = jnp.ones_like(s), jnp.zeros_like(s)
+	phi = jnp.stack([one, t, s, s * t, t * t, s * s], axis=-1)  # height rows [batch, k, 6]
+	rs = nz[..., None] * jnp.stack([zero, zero, one, t, zero, 2 * s], axis=-1)  # dh/ds rows
+	rt = nz[..., None] * jnp.stack([zero, one, zero, s, 2 * t, zero], axis=-1)  # dh/dt rows
+	wp, wn = w_pos[..., None, None], w_nrm[..., None, None]
+	M = jnp.sum(
+		wp * phi[..., :, None] * phi[..., None, :] + wn * (rs[..., :, None] * rs[..., None, :] + rt[..., :, None] * rt[..., None, :]),
+		axis=1,
+	)
+	b = jnp.sum(w_pos[..., None] * phi * h[..., None] - w_nrm[..., None] * (rs * ns[..., None] + rt * nt[..., None]), axis=1)
+	ridge = WLS_RIDGE * jnp.sum(w_pos + w_nrm, axis=-1)[:, None, None] + 1e-12
+	return jnp.linalg.solve(M + ridge * jnp.eye(6, dtype=M.dtype), b[..., None])[..., 0]
+
+
 class CrossAttentionBlock(nnx.Module):
 	"""Pre-norm cross-attention block: queries x attend to context y, then a feed-forward block on x."""
 
@@ -1176,12 +1204,15 @@ class InputFeatures(nnx.Module):
 		positions: jax.Array,  # [batch, k, 3]
 		normals: jax.Array,  # [batch, k, 3]
 		basis=None,
+		return_geometry=False,
 	) -> jax.Array:
 		"""
 		Compute geometric features relative to first point (center).
 
 		basis: None (the legacy frame orthonormal_basis_with_rotation(n, 0)) or (s_hat, t_hat), each [batch, 1, 3]: the
 			tangent frame of the local coordinates (FundamentalFormPredictor frame options).
+		return_geometry: also return the [batch, k, 6] local coordinates and normals (s, t, h, n_s, n_t, n_z) in units of
+			the median distance (--wls).
 
 		Returns:
 			[batch, k, output_dim] geometric encodings
@@ -1223,8 +1254,11 @@ class InputFeatures(nnx.Module):
 
 		# [local coordinates (3), normals in local coordinates (3)]
 		geometric_features = jnp.concatenate([coordinates, local_normals], axis=-1)  # [batch, k, input_dim]
+		local_geometry = geometric_features
 		if self.input_mlp:
 			geometric_features = geometric_input_features(coordinates, local_normals)
+		if return_geometry:
+			return self.mlp(geometric_features), median, local_geometry
 
 		return self.mlp(geometric_features), median
 
@@ -1239,6 +1273,8 @@ ARCH_DEFAULTS = dict(
 	n_latents=8,  # perceiver: number of latent tokens
 	n_cross=2,  # perceiver: cross-attention blocks (latents <- neighbour tokens)
 	n_self=2,  # perceiver: latent self-attention blocks after each cross-attention
+	wls=False,  # coefficients = weighted least-squares jet fit (learned weights) + bounded residual (weighted_jet_fit)
+	wls_bound=1.0,  # --wls: bound of the residual (units of the neighbourhood's median distance)
 )
 
 
@@ -1301,6 +1337,20 @@ class FundamentalFormPredictor(nnx.Module):
 
 		self.final_norm = nnx.LayerNorm(embed_dim, rngs=rngs)
 
+		if self.arch['wls']:
+			# --wls: per-neighbour weights (position, normal) of the jet fit, softplus(0.5413) = 1 at initialization
+			# (plain least squares); the head below then predicts the bounded residual, zero at initialization.
+			self.wls_weights = nnx.Linear(
+				embed_dim,
+				2,
+				kernel_init=nnx.initializers.zeros_init(),
+				bias_init=nnx.initializers.constant(jnp.array([0.5413, 0.5413])),
+				rngs=rngs,
+			)
+			if self.arch['encoder'] == 'perceiver':
+				# per-token features for the weights: the neighbour tokens attend to the final latents
+				self.token_decoder = CrossAttentionBlock(embed_dim, n_heads, mlp_dim, rngs=rngs)
+
 		# Projection
 		# (a00, a01, a10, a11, a02, a20)
 		self.mlp = nnx.Sequential(
@@ -1309,7 +1359,9 @@ class FundamentalFormPredictor(nnx.Module):
 				6,
 				kernel_init=nnx.initializers.zeros_init(),
 				# bias_init=nnx.initializers.ones_init(),
-				bias_init=nnx.initializers.constant(jnp.array([0.0, 0.0, 0.0, 0.0, -0.5, -0.5])),
+				bias_init=nnx.initializers.constant(
+					jnp.zeros(6) if self.arch['wls'] else jnp.array([0.0, 0.0, 0.0, 0.0, -0.5, -0.5])
+				),
 				rngs=rngs,
 			),
 		)
@@ -1363,7 +1415,7 @@ class FundamentalFormPredictor(nnx.Module):
 	def _forward_in_frame(self, positions, normals, s_hat, t_hat):
 		"""The network on neighborhoods expressed in the tangent frame (s_hat, t_hat) ([batch, 1, 3] each) -> the six
 		coefficients in that frame, scaled back to world units."""
-		x, scale = self.input_encoder(positions, normals, basis=(s_hat, t_hat))
+		x, scale, geometry = self.input_encoder(positions, normals, basis=(s_hat, t_hat), return_geometry=True)
 		if self.arch['encoder'] == 'perceiver':
 			tokens = x + self.token_mlp(x)
 			lat = jnp.broadcast_to(self.latents[...], (x.shape[0],) + self.latents.shape)
@@ -1372,12 +1424,18 @@ class FundamentalFormPredictor(nnx.Module):
 				lat = cross(lat, tokens)
 				for block in self.latent_blocks[i * n_self : (i + 1) * n_self]:
 					lat = block(lat)
-			x = jnp.mean(self.final_norm(lat), axis=1)
+			lat = self.final_norm(lat)
+			x = jnp.mean(lat, axis=1)
+			per_token = self.token_decoder(tokens, lat) if self.arch['wls'] else None
 		else:
 			for block in self.blocks:
 				x = block(x)
-			x = self.final_norm(x)[:, 0, :]
+			per_token = self.final_norm(x)
+			x = per_token[:, 0, :]
 		c = self.mlp(x)
+		if self.arch['wls']:
+			w = jax.nn.softplus(self.wls_weights(per_token))  # [batch, k, 2]
+			c = weighted_jet_fit(geometry, w[..., 0], w[..., 1]) + self.arch['wls_bound'] * jnp.tanh(c)
 		return jnp.stack([c[:, 0] * scale, c[:, 1], c[:, 2], c[:, 3] / scale, c[:, 4] / scale, c[:, 5] / scale], axis=-1)
 
 	@nnx.jit

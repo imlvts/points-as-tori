@@ -1405,6 +1405,14 @@ def parse_args(argv=None):
 	ap.add_argument('--cross-layers', type=int, default=2, help='perceiver: number of cross-attention blocks')
 	ap.add_argument('--self-layers', type=int, default=2, help='perceiver: latent self-attention blocks per cross-attention')
 	ap.add_argument(
+		'--wls',
+		action='store_true',
+		help="architecture: the six coefficients are a weighted least-squares jet fit to the neighbours' heights and "
+		'normals, with per-neighbour weights predicted by the network (uniform at initialization), plus a residual '
+		'bounded by --wls-bound (tanh). Saved with the model',
+	)
+	ap.add_argument('--wls-bound', type=float, default=1.0, help='--wls: residual bound (units of the median distance)')
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1457,10 +1465,12 @@ def main(argv=None):
 
 def arch_options(a):
 	"""The architecture options of the command line that differ from the authors' network (network.ARCH_DEFAULTS)."""
-	opts = dict(frame=a.frame, input_mlp=a.input_mlp, encoder=a.encoder)
+	opts = dict(frame=a.frame, input_mlp=a.input_mlp, encoder=a.encoder, wls=a.wls)
+	if a.wls:
+		opts.update(wls_bound=a.wls_bound)
 	if a.encoder == 'perceiver':
 		opts.update(n_latents=a.latents, n_cross=a.cross_layers, n_self=a.self_layers)
-	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k] or k in ('n_latents', 'n_cross', 'n_self')}
+	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k] or k in ('n_latents', 'n_cross', 'n_self', 'wls_bound')}
 
 
 if __name__ == '__main__':
