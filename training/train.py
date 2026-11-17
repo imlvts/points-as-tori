@@ -478,6 +478,7 @@ def TrainFundamentalFormPredictor(
 	schedule_total=0,
 	carry_opt=False,
 	ema=0.0,
+	normal_noise=0.0,
 ):
 	"""
 	Args:
@@ -503,6 +504,8 @@ def TrainFundamentalFormPredictor(
 			the EMA weights are what is validated, saved as the model (<name>.pkl, with 'ema_count') and gated; the raw
 			weights are saved as <name>_raw.pkl. A phase that starts from a model with a _raw.pkl trains the raw weights
 			and continues the EMA from the model's (0: off)
+		normal_noise: with multishape: angular noise of normal_noise degrees on the input normals of every visit (data
+			shapes and analytic scenes; the ground truth stays exact; --aux-curv then drops its tilt terms) (0: off)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -708,8 +711,8 @@ def TrainFundamentalFormPredictor(
 	total_shapes = len(all_shape_indices)
 	if resample and not multishape:
 		raise ValueError('resample needs multi-shape patch batches (multishape > 0)')
-	if (noise or quantize) and not multishape:
-		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
+	if (noise or quantize or normal_noise) and not multishape:
+		raise ValueError('noise, quantize and normal_noise need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
 	if aux_curv and not mix:
@@ -865,6 +868,7 @@ def TrainFundamentalFormPredictor(
 			normal_weight,
 			lipschitz_from=2 * n_per_type if lipschitz_cube else 0,
 			aux_weight=aux_curv,
+			aux_tilt=not normal_noise,
 		)
 		want_normals = normal_weight > 0
 		normal_mask = np.arange(n_queries_per_neighborhood) < (2 if normal_band else 1) * n_per_type
@@ -893,6 +897,8 @@ def TrainFundamentalFormPredictor(
 				P, N, k1, k2 = scenes['P'][i], scenes['N'][i], scenes['k1'][i], scenes['k2'][i]
 			R = augment.random_rotation(rng) if rotate else np.eye(3)
 			P, N = P @ R.T, N @ R.T
+			if normal_noise:
+				N = augment.perturb_normals(N, normal_noise, rng)
 			patch, curv = augment.make_patch(
 				P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng,
 				point_data=np.stack([k1, k2], -1),
@@ -916,7 +922,7 @@ def TrainFundamentalFormPredictor(
 				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
 				shape_resample = resample if (resample and resample_match in training_data_filenames[dataset_idx]) else ''
 				P, N, NB, M, V, F, FM, tree = augment.visit(
-					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize
+					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise
 				)
 				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
 				patches.append(patch + (V, F, FM, {}))
@@ -1639,6 +1645,13 @@ def parse_args(argv=None):
 		help='with --multishape: quantize the input points along a random direction per visit to steps of Q sigma (0: off)',
 	)
 	ap.add_argument(
+		'--normal-noise',
+		type=float,
+		default=0.0,
+		metavar='DEG',
+		help='with --multishape: angular noise of DEG degrees (std of each tangent component) on the input normals (0: off)',
+	)
+	ap.add_argument(
 		'--mix',
 		default='',
 		metavar='analytic:FRAC:PATH',
@@ -1756,6 +1769,7 @@ def main(argv=None):
 		wsd_decay=a.wsd_decay,
 		carry_opt=a.carry_opt,
 		ema=a.ema,
+		normal_noise=a.normal_noise,
 	)
 
 

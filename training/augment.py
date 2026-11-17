@@ -8,7 +8,8 @@ to a fixed size (upad) so every step has the same shapes; if U is larger, the po
 
 Per visit of a shape (visit), optionally: fresh area-uniform points on the ground-truth mesh at a random density
 (--resample), with the k-NN recomputed; a random rotation of points, normals and mesh (--rotate); Gaussian noise on
-the input points (--noise); directional quantization of the input points (--quantize). Perturbations change the input points only: normals and the ground-truth mesh stay exact,
+the input points (--noise); directional quantization of the input points (--quantize); angular noise on the input
+normals (--normal-noise). Perturbations change the input points only: normals and the ground-truth mesh stay exact,
 so the network learns to fit the clean surface to perturbed input.
 """
 
@@ -36,7 +37,18 @@ def quantize_along(P, direction, step):
 	return P + (step * np.round(h / step) - h)[:, None] * direction[None, :]
 
 
-def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.0):
+def perturb_normals(N, degrees, rng):
+	"""Angular noise on unit normals: n + g projected to the tangent plane, g ~ N(0, (degrees in radians)^2 I),
+	renormalized (each tangent component of the tilt has standard deviation ~degrees). Zero (padded) normals stay zero."""
+	g = rng.normal(size=N.shape) * np.radians(degrees)
+	g -= np.sum(g * N, axis=-1, keepdims=True) * N
+	M = N + g
+	norm = np.linalg.norm(M, axis=-1, keepdims=True)
+	valid = np.linalg.norm(N, axis=-1, keepdims=True) > 0
+	return np.where(valid, M / np.where(valid, norm, 1.0), N)
+
+
+def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.0, normal_noise=0.0):
 	"""
 	One visit of a stored shape -> (P, N, NB, M, V, F, FM, tree); tree is None when the stored k-NN are used.
 
@@ -47,6 +59,7 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 		the perturbation); padding is dropped and the k-NN are recomputed on the perturbed points.
 	quantize: round the coordinate of the points along a random direction (one per visit) to multiples of
 		quantize sigma (applied before the noise); padding is dropped and the k-NN are recomputed.
+	normal_noise: angular noise of normal_noise degrees on the input normals (perturb_normals; k-NN unchanged).
 	"""
 	P, N, NB, M, V, F, FM = arrays
 	tree = None
@@ -71,6 +84,8 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 		if noise:
 			P = P + rng.normal(size=P.shape) * (noise * sigma)
 		NB = None
+	if normal_noise:
+		N = perturb_normals(N, normal_noise, rng)
 	if NB is None:
 		tree = cKDTree(P)
 	return P, N, NB, M, V, F, FM, tree
