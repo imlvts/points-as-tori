@@ -237,6 +237,7 @@ def FundamentalFormPredictorTrainer(
 	clip=0.0,
 	eikonal_weight=1.0,
 	schedule_fn=None,
+	count_offset=0,
 ):
 	"""
 	Set up network (model) with the given parameters.
@@ -244,6 +245,7 @@ def FundamentalFormPredictorTrainer(
 	clip: clip the gradient to this global norm before the AdamW update (0: no clipping)
 	schedule_fn: learning rate as a function of the optimizer step count (None: linear warmup, then cosine decay to 1 %
 		over total_steps)
+	count_offset: the step count of a restored optimizer state (--carry-opt): the schedule sees count - count_offset
 
 	Returns: (model, optimizer, train_step) where train_step() is a function that trains the model for a single step.
 	"""
@@ -267,6 +269,8 @@ def FundamentalFormPredictorTrainer(
 	)
 	if schedule_fn is not None:
 		schedule = schedule_fn
+	if count_offset:
+		schedule = partial(lambda count, base: base(count - count_offset), base=schedule)
 
 	# Optimizer
 	optimizer = nnx.Optimizer(
@@ -472,6 +476,7 @@ def TrainFundamentalFormPredictor(
 	wsd_decay=0.2,
 	schedule_offset=0,
 	schedule_total=0,
+	carry_opt=False,
 ):
 	"""
 	Args:
@@ -490,6 +495,9 @@ def TrainFundamentalFormPredictor(
 			starts fresh has a linear warmup over warmup_steps)
 		wsd_decay: the fraction of the curriculum's steps in the final decay of the 'wsd' schedule
 		schedule_offset, schedule_total: steps of the curriculum before this phase, and in all (set by train())
+		carry_opt: save the optimizer state (AdamW moments, step count) next to the final model (<name>_opt.pkl) and,
+			if load_model_path has one, start from it instead of a fresh AdamW (the schedule continues from the phase
+			start; no new warmup with 'wsd')
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -565,11 +573,21 @@ def TrainFundamentalFormPredictor(
 		total_steps = schedule_total
 	else:
 		raise ValueError(f'unknown schedule {schedule!r}')
+	saved_opt = None
+	if carry_opt and load_model_path not in (None, 'random'):
+		opt_path = os.path.splitext(load_model_path)[0] + '_opt.pkl'
+		if os.path.exists(opt_path):
+			with open(opt_path, 'rb') as f:
+				saved_opt = pickle.load(f)
+			print(f"Carrying the optimizer state of {opt_path} (step {saved_opt['step']})")
+		else:
+			print(f'No optimizer state {opt_path}: fresh optimizer')
+	count_offset = saved_opt['step'] if saved_opt else 0
 	schedule_fn = None
 	if schedule == 'wsd':
 		decay_start = schedule_total * (1.0 - wsd_decay)
 
-		def schedule_fn(count, warm=float(warmup_steps), offset=float(schedule_offset)):
+		def schedule_fn(count, warm=0.0 if saved_opt else float(warmup_steps), offset=float(schedule_offset)):
 			local = jnp.asarray(count, jnp.float32)
 			t = offset + local
 			warmup_factor = jnp.minimum(1.0, local / warm) if warm > 0 else 1.0
@@ -593,7 +611,10 @@ def TrainFundamentalFormPredictor(
 		clip=clip,
 		eikonal_weight=eikonal_weight,
 		schedule_fn=schedule_fn,
+		count_offset=count_offset,
 	)
+	if saved_opt:
+		nnx.update(optimizer, saved_opt['state'])
 
 	# Load pretrained model if specified ('random' or None: keep the fresh initialization)
 	if load_model_path is not None and load_model_path != 'random':
@@ -1171,6 +1192,11 @@ def TrainFundamentalFormPredictor(
 
 	# Save final model
 	save_model(model, num_epochs - 1, final_save_filepath)
+	if carry_opt:
+		opt_path = os.path.join(models_dir, (final_save_filepath or f'FundamentalFormPredictor_{num_epochs - 1}') + '_opt.pkl')
+		with open(opt_path, 'wb') as f:
+			pickle.dump({'state': jax.device_get(nnx.state(optimizer)), 'step': int(optimizer.step[...])}, f)
+		print(f'Optimizer state saved to {opt_path}')
 
 	# Plot training history
 
@@ -1504,6 +1530,12 @@ def parse_args(argv=None):
 		'a phase with a fresh optimizer warms up over --warmup steps)',
 	)
 	ap.add_argument(
+		'--carry-opt',
+		action='store_true',
+		help='carry the AdamW state (moments, step count) from each phase to the next (saved as <model>_opt.pkl) instead of '
+		'a fresh optimizer per phase',
+	)
+	ap.add_argument(
 		'--wsd-decay',
 		type=float,
 		default=0.2,
@@ -1666,6 +1698,7 @@ def main(argv=None):
 		lipschitz_cube=a.lipschitz_cube,
 		aux_curv=a.aux_curv,
 		wsd_decay=a.wsd_decay,
+		carry_opt=a.carry_opt,
 	)
 
 
