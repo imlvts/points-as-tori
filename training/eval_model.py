@@ -51,11 +51,14 @@ MESHES = ['block', 'femur', 'knot']
 
 
 # ---------------------------------------------------------------- models
-def load_model(path):
-	"""-> (model in eval mode, k_neighbors). A train.py .pkl, or an .npz of flat Flax paths with a '__config__' entry."""
+def load_model(path, frame=None):
+	"""-> (model in eval mode, k_neighbors). A train.py .pkl, or an .npz of flat Flax paths with a '__config__' entry.
+	frame: None (the model's own) or a frame option (network.FRAMES) to evaluate the same weights in."""
 	if path.endswith('.npz'):
 		z = np.load(path)
 		cfg = json.loads(str(z['__config__']))
+		if frame is not None:
+			cfg['arch'] = {**cfg.get('arch', {}), 'frame': frame}
 		model = FundamentalFormPredictor(
 			embed_dim=cfg['embed_dim'],
 			n_freq=cfg.get('n_freq', 0) or 0,
@@ -77,7 +80,7 @@ def load_model(path):
 		nnx.update(model, jax.tree_util.tree_unflatten(treedef, new))
 		nnx.eval_mode(model)
 		return model, cfg['k_neighbors']
-	return FundamentalFormPredictor.load_saved_model(path)
+	return FundamentalFormPredictor.load_saved_model(path, frame=frame)
 
 
 class CoeffsWithAux(np.ndarray):
@@ -484,9 +487,9 @@ def gate_report(res):
 	return lines, ok_all
 
 
-def evaluate(path, label=None, out_dir=None, validation_file=None, loss=True):
+def evaluate(path, label=None, out_dir=None, validation_file=None, loss=True, frame=None):
 	t0 = time.time()
-	model, k = load_model(path)
+	model, k = load_model(path, frame)
 	label = label or os.path.splitext(os.path.basename(path))[0]
 	res = dict(model=os.path.abspath(path), label=label)
 	res['curv'], res['curv_rows'] = curvature_tracking(model, k)
@@ -527,12 +530,18 @@ def main(argv=None):
 	ap.add_argument('--validation-file', default=None, help='default: DATA_DIR/ABC17_validation_3.npz')
 	ap.add_argument('--no-loss', action='store_true', help='skip the loss on fixed validation queries')
 	ap.add_argument('--gate', action='store_true', help='print the gate checks for each model')
+	ap.add_argument(
+		'--frame',
+		choices=['legacy', 'continuous', 'invariant'],
+		default=None,
+		help="evaluate the weights in this tangent frame (default: the model's own; see train.py --frame)",
+	)
 	a = ap.parse_args(argv)
 	vf = a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz')
 	print(HEAD, flush=True)
 	for m in a.models:
 		label, path = m.split('=', 1) if '=' in m else (None, m)
-		r = evaluate(path, label, a.out, vf, loss=not a.no_loss)
+		r = evaluate(path, label, a.out, vf, loss=not a.no_loss, frame=a.frame)
 		print(row(r), flush=True)
 		if a.gate:
 			for line in gate_report(r)[0]:

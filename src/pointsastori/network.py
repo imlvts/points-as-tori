@@ -1588,15 +1588,19 @@ class FundamentalFormPredictor(nnx.Module):
 		return predicted_coefficients
 
 	@staticmethod
-	def load_saved_model(filepath: str):
+	def load_saved_model(filepath: str, frame: str = None):
 		"""
 		Given the filepath where weights are saved, return the model and its parameters.
+		frame: None (the saved model's) or a frame option (FRAMES) to evaluate the same weights in, e.g. 'invariant' (the
+			frame options do not change the parameters).
 		"""
 		with open(filepath, 'rb') as f:
 			saved_data = pickle.load(f)
 
 		n_freq = saved_data['n_freq'] if 'n_freq' in saved_data else 0
 		arch = saved_data.get('arch', {})  # architecture options; absent in the released .pkl (= the defaults)
+		if frame is not None:
+			arch = {**arch, 'frame': frame}
 
 		loaded_model = FundamentalFormPredictor(
 			embed_dim=saved_data['embed_dim'],

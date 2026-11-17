@@ -30,6 +30,7 @@ class PointsAsTori:
 		tori: dict = None,
 		tori_filepath: str = None,
 		model_path: str = None,
+		frame: str = None,
 	) -> None:
 		"""
 		Args:
@@ -40,6 +41,9 @@ class PointsAsTori:
 			tori_filepath: filepath to precomputed tori
 			model_path: path to a .pkl model file representing a trained neural network.
 				Defaults to the included pre-trained model.
+			frame: None (the model's own) or 'invariant' / 'continuous' / 'legacy': evaluate the network in that tangent
+				frame (network.FRAMES). 'invariant' averages three frames attached to each neighbourhood: exactly
+				rotation-invariant tori, 3x the network cost. Off by default.
 		"""
 		self._tdf = TorusDistanceField(points, normals)
 
@@ -53,7 +57,7 @@ class PointsAsTori:
 			if not os.path.isfile(model_path):
 				raise FileNotFoundError(f'Model file not found: {model_path}')
 
-			model, k_nb = PointsAsTori._load_model(model_path)
+			model, k_nb = PointsAsTori._load_model(model_path, frame)
 
 			coeffs, aux = model.precompute_coefficients_in_chunks(points, normals, k_nb, chunk_size=50000, return_aux=True)
 			centers, axes, major_radii, minor_radii = fit_tori_from_forms(points, normals, np.array(coeffs))
@@ -120,8 +124,8 @@ class PointsAsTori:
 		return distances, gradients
 
 	@staticmethod
-	def _load_model(model_path: str):
-		model, k_neighbors = FundamentalFormPredictor.load_saved_model(model_path)
+	def _load_model(model_path: str, frame: str = None):
+		model, k_neighbors = FundamentalFormPredictor.load_saved_model(model_path, frame=frame)
 		return model, k_neighbors
 
 	def save_tori(self, filepath: str = 'tori/tori.pkl') -> None:
