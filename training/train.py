@@ -1301,8 +1301,10 @@ def parse_args(argv=None):
 	ap.add_argument('--max-steps', type=int, default=0, help='stop each phase after this many steps (0: all epochs)')
 	ap.add_argument(
 		'--gate',
-		action='store_true',
-		help='after every phase, evaluate its model (eval_model.py, about 2 min) and print the gate checks; log only',
+		action=argparse.BooleanOptionalAction,
+		default=False,
+		help='after every phase, evaluate its model (eval_model.py, about 2 min) and print the gate checks; log only '
+		'(--no-gate: off, e.g. to drop the gate of a preset)',
 	)
 	ap.add_argument('--log-every', type=int, default=0, help='print the mean loss every N steps (0: off)')
 	ap.add_argument('--lr', type=float, default=None, help="peak learning rate of every phase (default: the curriculum's)")
