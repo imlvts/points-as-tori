@@ -93,6 +93,7 @@ def SDF_loss(
 	knn_blend=0,
 	eikonal_weight=1.0,
 	distance_scale=None,
+	true_normals=None,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -108,6 +109,9 @@ def SDF_loss(
 		knn_blend: blend over the knn_blend nearest points of each query (0: all points; see torus_distance_gradient_masked)
 		eikonal_weight: weight of the eikonality term (the distance term has weight 1)
 		distance_scale: None, or (batch_size,) factors of the distance errors of each row (--dist-sigma: ref / sigma_c)
+		true_normals: None, or (batch_size, n_queries, 3) true SDF gradients (zero where unknown): adds
+			loss_dict['normal_loss'], the mean of 1 - cos(angle(grad phi, true normal)) over the queries with a known
+			normal (--normal-w; not added to the returned loss)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
@@ -151,6 +155,14 @@ def SDF_loss(
 		'distance_loss': distance_loss,
 		'eikonality_loss': eikonality_loss,
 	}
+
+	if true_normals is not None:
+		# 1 - cos of the angle between grad phi and the true normal; the normalization is safe at grad phi = 0
+		g_sq = jnp.sum(predicted_gradients * predicted_gradients, axis=-1)
+		cosine = jnp.sum(predicted_gradients * true_normals, axis=-1) / jnp.sqrt(g_sq + 1e-12)
+		normal_valid = (jnp.sum(true_normals * true_normals, axis=-1) > 0.25) & batch_mask[:, None] & jnp.isfinite(cosine)
+		n_normal = jnp.sum(normal_valid)
+		loss_dict['normal_loss'] = jnp.sum(jnp.where(normal_valid, 1.0 - cosine, 0.0)) / jnp.maximum(n_normal, 1)
 
 	return loss, loss_dict
 
@@ -321,13 +333,14 @@ def FundamentalFormPredictorTrainer(
 # ========================================================================
 
 
-def make_patch_step(knn_blend=0, eikonal_weight=1.0):
+def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0):
 	"""
 	Train step on S patches (augment.make_patch), one per shape: the network runs on the patch unions, and SDF_loss is
 	evaluated per patch (tori and blend restricted to the union) on the queries of the patch centres; the loss is the
 	mean over the patches.
 	extras: dict of optional per-patch arrays (the flags of the loss): 'dscale' (S, C) factors of the distance errors
-	of each centre's queries (--dist-sigma).
+	of each centre's queries (--dist-sigma); 'qnormals' (S, C, n_queries, 3) true SDF gradients of the queries (zero where
+	unknown; --normal-w: the loss gets normal_weight * the mean 1 - cos of their angle with grad phi).
 	"""
 
 	@nnx.jit
@@ -344,13 +357,17 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0):
 			_, loss_dict = jax.vmap(
 				lambda m, p, n, c, q, d, ex: SDF_loss(
 					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight,
-					distance_scale=ex.get('dscale'),
+					distance_scale=ex.get('dscale'), true_normals=ex.get('qnormals'),
 				)
 			)(Umask, Upos, Unrm, coefficients, queries, true_distances, extras)
 			distance_loss = jnp.mean(loss_dict['distance_loss'])
 			eikonality_loss = jnp.mean(loss_dict['eikonality_loss'])
 			loss = distance_loss + eikonal_weight * eikonality_loss
-			return loss, {'distance_loss': distance_loss, 'eikonality_loss': eikonality_loss}
+			out = {'distance_loss': distance_loss, 'eikonality_loss': eikonality_loss}
+			if 'normal_loss' in loss_dict:
+				out['normal_loss'] = jnp.mean(loss_dict['normal_loss'])
+				loss = loss + normal_weight * out['normal_loss']
+			return loss, out
 
 		(loss, loss_dict), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
 		grads = jax.tree_util.tree_map(lambda x: x if x is None else jnp.where(jnp.isnan(x), 0.0, x), grads)
@@ -394,6 +411,8 @@ def TrainFundamentalFormPredictor(
 	band_sigma=0.0,
 	min_extent_sigma=0.0,
 	dist_sigma=0.0,
+	normal_weight=0.0,
+	normal_band=False,
 ):
 	"""
 	Args:
@@ -434,6 +453,10 @@ def TrainFundamentalFormPredictor(
 			its centre), i.e. measured in units of the local scale and rescaled by the constant dist_sigma (a typical
 			sigma, so that the loss keeps its size and the eikonality weight and the clipping their meaning; 0: off,
 			world units)
+		normal_weight: with multishape: add normal_weight * mean(1 - cos(angle(grad phi, n))) over the zero-set queries
+			(n: the true surface normal; face normal on meshes, exact SDF gradient on analytic scenes) (0: off)
+		normal_band: the normal term also covers the narrow-band queries with a known true gradient (on meshes: those
+			whose ground-truth distance equals their offset along the face normal; on analytic scenes: all)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -549,8 +572,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
-	if (band_sigma or min_extent_sigma or dist_sigma) and not multishape:
-		raise ValueError('band_sigma, min_extent_sigma and dist_sigma need multi-shape patch batches (multishape > 0)')
+	if (band_sigma or min_extent_sigma or dist_sigma or normal_weight) and not multishape:
+		raise ValueError('band_sigma, min_extent_sigma, dist_sigma and normal_weight need multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -680,7 +703,10 @@ def TrainFundamentalFormPredictor(
 		"""The multi-shape patch loop (multishape > 0); batches are prepared on the CPU one step ahead."""
 		if not max_steps:
 			raise ValueError('multi-shape patch batches need the number of steps of the phase (max_steps)')
-		patch_step = make_patch_step(knn_blend, eikonal_weight)
+		n_per_type = n_queries_per_neighborhood // 3  # queries: zero set, band, cube (n_per_type each)
+		patch_step = make_patch_step(knn_blend, eikonal_weight, normal_weight)
+		want_normals = normal_weight > 0
+		normal_mask = np.arange(n_queries_per_neighborhood) < (2 if normal_band else 1) * n_per_type
 		rng = np.random.default_rng(seed + 1000)
 		stream = []
 
@@ -740,11 +766,11 @@ def TrainFundamentalFormPredictor(
 			patches = future.result()
 			future = pool.submit(prepare, next_shapes())
 			step_key = jax.random.fold_in(key, step)
-			queries, distances = [], []
+			queries, distances, qnormals = [], [], []
 			for j, pt in enumerate(patches):
 				if isinstance(pt[7], str):  # analytic scene: exact-SDF queries
 					E, types, polys, pcount, R = pt[8]
-					q, d, _ = analytic_sdf.analytic_queries(
+					res = analytic_sdf.analytic_queries(
 						jnp.asarray(pt[5]),
 						jnp.asarray(E),
 						jnp.asarray(types),
@@ -755,13 +781,17 @@ def TrainFundamentalFormPredictor(
 						bbox_extension=bbox_extension,
 						band_sigma=band_sigma,
 						min_extent_sigma=min_extent_sigma,
+						return_normals=want_normals,
 					)
+					q, d = res[0], res[1]
+					if want_normals:
+						qnormals.append(res[2])
 					queries.append(q)
 					distances.append(d)
 					union_sizes.append(pt[6])
 					n_analytic += 1
 					continue
-				q, d = generate_neighborhood_features(
+				res = generate_neighborhood_features(
 					jnp.asarray(pt[5]),
 					jnp.asarray(pt[7], jnp.float32),
 					jnp.asarray(pt[8]),
@@ -772,7 +802,11 @@ def TrainFundamentalFormPredictor(
 					bbox_extension=bbox_extension,
 					band_sigma=band_sigma,
 					min_extent_sigma=min_extent_sigma,
+					return_normals=want_normals,
 				)
+				q, d = res[0], res[1]
+				if want_normals:
+					qnormals.append(res[2])
 				queries.append(q)
 				distances.append(d)
 				union_sizes.append(pt[6])
@@ -782,6 +816,8 @@ def TrainFundamentalFormPredictor(
 				cn = np.stack([pt[5] for pt in patches])  # (S, C, k, 3)
 				sig_c = np.median(np.linalg.norm(cn - cn[:, :, :1], axis=-1), axis=-1)  # (S, C)
 				extras['dscale'] = jnp.asarray(dist_sigma / np.maximum(sig_c, 1e-12), jnp.float32)
+			if want_normals:
+				extras['qnormals'] = jnp.stack(qnormals) * jnp.asarray(normal_mask[:, None], jnp.float32)
 			loss, loss_dict = patch_step(
 				model,
 				optimizer,
@@ -795,13 +831,15 @@ def TrainFundamentalFormPredictor(
 				extras,
 			)
 			step += 1
-			log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss']))
+			extra_terms = [k for k in ('normal_loss', 'aux_loss') if k in loss_dict]
+			log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss'], *(loss_dict[k] for k in extra_terms)))
 			if (log_every and step % log_every == 0) or step == max_steps:
 				v = np.array([[float(x) for x in r] for r in log_buffer])
 				now = time.time()
 				print(
 					f'[step] {step} loss {v[:, 0].mean():.8f} distance {v[:, 1].mean():.8f} eikonality {v[:, 2].mean():.8f} '
-					f'{(now - t_log) / len(v):.3f} s/step union mean {np.mean(union_sizes):.0f} max {np.max(union_sizes)}'
+					+ ''.join(f'{k.split("_")[0]} {v[:, 3 + i].mean():.8f} ' for i, k in enumerate(extra_terms))
+					+ f'{(now - t_log) / len(v):.3f} s/step union mean {np.mean(union_sizes):.0f} max {np.max(union_sizes)}'
 					+ (f' analytic patches {n_analytic}' if mix else ''),
 					flush=True,
 				)
@@ -1424,6 +1462,17 @@ def parse_args(argv=None):
 		help='with --multishape: distance errors in units of the centre\'s sigma_c, times REF (a typical sigma, e.g. 0.125 for '
 		'--resample 1024:8192; 0: off, world units)',
 	)
+	ap.add_argument(
+		'--normal-w',
+		type=float,
+		default=0.0,
+		metavar='W',
+		help='with --multishape: add W * mean(1 - cos) of the angle between grad phi and the true normal at the zero-set '
+		'queries (0: off)',
+	)
+	ap.add_argument(
+		'--normal-band', action='store_true', help='--normal-w also on the narrow-band queries with a known true gradient'
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1480,6 +1529,8 @@ def main(argv=None):
 		band_sigma=a.band_sigma,
 		min_extent_sigma=a.min_extent_sigma,
 		dist_sigma=a.dist_sigma,
+		normal_weight=a.normal_w,
+		normal_band=a.normal_band,
 	)
 
 
