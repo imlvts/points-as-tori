@@ -48,7 +48,7 @@ def perturb_normals(N, degrees, rng):
 	return np.where(valid, M / np.where(valid, norm, 1.0), N)
 
 
-def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.0, normal_noise=0.0):
+def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.0, normal_noise=0.0, decimated_max=0):
 	"""
 	One visit of a stored shape -> (P, N, NB, M, V, F, FM, tree); tree is None when the stored k-NN are used.
 
@@ -60,11 +60,17 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 	quantize: round the coordinate of the points along a random direction (one per visit) to multiples of
 		quantize sigma (applied before the noise); padding is dropped and the k-NN are recomputed.
 	normal_noise: angular noise of normal_noise degrees on the input normals (perturb_normals; k-NN unchanged).
+	decimated_max: > 0: with resample, a mesh whose face count is the padded maximum (it was decimated to that
+		limit, 2048 in the released data) is resampled to at most decimated_max points (the counts of resample up to
+		it; the smallest one if none).
 	"""
 	P, N, NB, M, V, F, FM = arrays
 	tree = None
 	if resample:
-		n = int(rng.choice(resample_counts(resample)))
+		counts = resample_counts(resample)
+		if decimated_max and FM.all():
+			counts = [c for c in counts if c <= decimated_max] or counts[:1]
+		n = int(rng.choice(counts))
 		P, N = sample_mesh_points(V.astype(np.float64), F[FM], n, rng)
 		M = np.ones(n, bool)
 		NB = None

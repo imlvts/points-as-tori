@@ -481,6 +481,7 @@ def TrainFundamentalFormPredictor(
 	normal_noise=0.0,
 	holes='',
 	seed_area=False,
+	resample_decimated=0,
 ):
 	"""
 	Args:
@@ -512,6 +513,8 @@ def TrainFundamentalFormPredictor(
 			(augment.make_patch; the ground truth stays complete) ('': off)
 		seed_area: with multishape: patch seeds drawn with probability ~ the surface area per point (augment.make_patch)
 			instead of uniformly over the points
+		resample_decimated: with resample: meshes decimated to the face limit of the data (all faces valid, 2048) are
+			resampled to at most this many points (0: off)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -931,7 +934,7 @@ def TrainFundamentalFormPredictor(
 				arrays = tuple(x[shape_idx] for x in all_training_data[dataset_idx])
 				shape_resample = resample if (resample and resample_match in training_data_filenames[dataset_idx]) else ''
 				P, N, NB, M, V, F, FM, tree = augment.visit(
-					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise
+					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise, resample_decimated
 				)
 				patch = augment.make_patch(
 					P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole, seed_area=seed_area
@@ -1639,6 +1642,14 @@ def parse_args(argv=None):
 		'--resample-match', default='', help='resample only shapes whose data file path contains this string (default: all)'
 	)
 	ap.add_argument(
+		'--resample-decimated',
+		type=int,
+		default=0,
+		metavar='MAX',
+		help='with --resample: meshes decimated to the face limit (2048 faces: every blob, the large ABC meshes) get at most '
+		'MAX points (0: off)',
+	)
+	ap.add_argument(
 		'--rotate', action='store_true', help='random rotation of every shape visit (points, normals, mesh)'
 	)
 	ap.add_argument(
@@ -1796,6 +1807,7 @@ def main(argv=None):
 		normal_noise=a.normal_noise,
 		holes=a.holes,
 		seed_area=a.seed_area,
+		resample_decimated=a.resample_decimated,
 	)
 
 
