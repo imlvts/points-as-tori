@@ -24,9 +24,14 @@ def random_rotation(rng):
 from scipy.spatial import cKDTree
 
 
+# Threads of the k-NN query of point_scale (the same result for any number; the query of all points was ~80 % of the
+# CPU batch preparation with --noise / --quantize, 0.27 s for 8 shapes, more than an L13 GPU step)
+KNN_WORKERS = 8
+
+
 def point_scale(P, tree, k):
 	"""sigma of a cloud: the median over its points of the median distance to their k nearest neighbors."""
-	d, _ = tree.query(P, k=k)
+	d, _ = tree.query(P, k=k, workers=KNN_WORKERS)
 	return float(np.median(np.median(d, axis=1)))
 
 

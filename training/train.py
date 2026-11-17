@@ -119,11 +119,11 @@ def SDF_loss(
 		aux: None or (max_points, 2) --aux-heads logits (flip, confidence) of the points (network.aux_blend_terms)
 	"""
 
-	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
+	origins, frames, kappas = torus_frames_masked(mask, positions, normals, coefficients)
 
 	sign, log_weight = (None, None) if aux is None else aux_blend_terms(aux)
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend, point_sign=sign, log_weight=log_weight
+		mask, queries, positions, origins, frames, kappas, knn=knn_blend, point_sign=sign, log_weight=log_weight
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -132,14 +132,16 @@ def SDF_loss(
 	if distance_scale is not None:
 		distance_error = distance_error * distance_scale[:, None]
 	distance_valid_mask = ~jnp.isnan(distance_error) & batch_mask[:, None]
-	distance_error_masked = jnp.sum(distance_error * distance_valid_mask, axis=-1)  # (batch_size,)
+	distance_error_masked = jnp.sum(jnp.where(distance_valid_mask, distance_error, 0.0), axis=-1)  # (batch_size,)
 	num_valid_distance_queries = jnp.sum(distance_valid_mask)
 
+	# |grad phi| with the square floored to NAN_EPSILON^2: the same value (to float32 resolution) and a finite derivative
+	# where the blended gradient vanishes (sqrt'(0) = inf gave NaN, which zeroed the whole step's gradient)
 	eikonality_error = jnp.abs(
-		1.0 - jnp.sqrt(jnp.sum(predicted_gradients * predicted_gradients, axis=-1))
+		1.0 - jnp.sqrt(jnp.maximum(jnp.sum(predicted_gradients * predicted_gradients, axis=-1), NAN_EPSILON**2))
 	)  # (batch_size, n_queries,)
 	if lipschitz_from:
-		grad_norm = jnp.sqrt(jnp.sum(predicted_gradients * predicted_gradients, axis=-1))
+		grad_norm = jnp.sqrt(jnp.maximum(jnp.sum(predicted_gradients * predicted_gradients, axis=-1), NAN_EPSILON**2))
 		one_sided = jnp.arange(queries.shape[1]) >= lipschitz_from
 		eikonality_error = jnp.where(one_sided[None], jnp.maximum(grad_norm - 1.0, 0.0), eikonality_error)
 	eikonality_valid_mask = ~jnp.isnan(eikonality_error) & batch_mask[:, None]  # (batch_size, n_queries)
@@ -189,18 +191,18 @@ def validation_loss(
 	knn_blend=0,
 	aux=None,
 ):
-	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
+	origins, frames, kappas = torus_frames_masked(mask, positions, normals, coefficients)
 
 	sign, log_weight = (None, None) if aux is None else aux_blend_terms(aux, hard=True)
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend, point_sign=sign, log_weight=log_weight
+		mask, queries, positions, origins, frames, kappas, knn=knn_blend, point_sign=sign, log_weight=log_weight
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
 	num_valid = jnp.sum(batch_mask)  # number of valid points in the neighborhood
 	distance_error = jnp.abs((predicted_distances - true_distances))  # (batch_size, n_queries, )
 	distance_valid_mask = ~jnp.isnan(distance_error) & batch_mask[:, None]
-	distance_error_masked = jnp.sum(distance_error * distance_valid_mask, axis=-1)  # (batch_size,)
+	distance_error_masked = jnp.sum(jnp.where(distance_valid_mask, distance_error, 0.0), axis=-1)  # (batch_size,)
 	num_valid_distance_queries = jnp.sum(distance_valid_mask)
 
 	eikonality_error = jnp.abs(
@@ -222,7 +224,12 @@ def validation_loss(
 		lambda: 0.0,
 	)
 
-	return distance_loss, eikonality_loss
+	return distance_loss, eikonality_loss, num_valid_distance_queries, num_valid_eikonality_queries
+
+
+# Rows (query neighborhoods) per call of the validation's query generation and loss: the validation of a whole shape at
+# once (2048 points x 120 queries against all faces / all points) needed a 14.5 GiB temporary buffer on the GPU.
+VALIDATION_CHUNK = 128
 
 
 def FundamentalFormPredictorTrainer(
@@ -865,6 +872,7 @@ def TrainFundamentalFormPredictor(
 				val_fmask,
 				val_key,
 				n_queries=n_queries_per_neighborhood,
+				chunk=VALIDATION_CHUNK,
 			)
 
 			# Compute weights for this validation shape
@@ -886,19 +894,25 @@ def TrainFundamentalFormPredictor(
 
 				# Only compute if batch has valid points
 				if jnp.sum(batch_mask) > 0:
-					val_loss, val_eikonality_loss = validation_loss(
-						val_mask,
-						batch_mask,
-						val_pos,
-						val_norm,
-						val_weights,
-						batch_queries,
-						batch_distances,
-						knn_blend=knn_blend,
-						aux=val_aux,
-					)
-					batch_val_losses.append(val_loss)
-					batch_val_eikonality_losses.append(val_eikonality_loss)
+					# The batch's mean errors from chunks of VALIDATION_CHUNK rows (sums over the chunks' valid queries):
+					# the same values up to rounding, with the memory of one chunk.
+					sums = np.zeros(4)
+					for c0 in range(0, batch_size, VALIDATION_CHUNK):
+						c1 = min(c0 + VALIDATION_CHUNK, batch_size)
+						dl, el, nd, ne = validation_loss(
+							val_mask,
+							batch_mask[c0:c1],
+							val_pos,
+							val_norm,
+							val_weights,
+							batch_queries[c0:c1],
+							batch_distances[c0:c1],
+							knn_blend=knn_blend,
+							aux=val_aux,
+						)
+						sums += [float(dl) * float(nd), float(el) * float(ne), float(nd), float(ne)]
+					batch_val_losses.append(sums[0] / sums[2] if sums[2] > 0 else 0.0)
+					batch_val_eikonality_losses.append(sums[1] / sums[3] if sums[3] > 0 else 0.0)
 
 			# Average over batches for this shape
 			if len(batch_val_losses) > 0:
@@ -988,6 +1002,26 @@ def TrainFundamentalFormPredictor(
 				patches.append(patch + (V, F, FM, {}))
 			return patches
 
+		# Queries of the data patches: one call vmapped over the patches, each with its key fold_in(step_key, j) (the same
+		# queries and distances as one generate_neighborhood_features call per patch; one dispatch instead of S)
+		data_queries = jax.jit(
+			jax.vmap(
+				lambda nbhds, V, F, FM, k: generate_neighborhood_features(
+					nbhds,
+					V,
+					F,
+					FM,
+					k,
+					n_queries=n_queries_per_neighborhood,
+					narrow_band_offset=narrow_band_offset,
+					bbox_extension=bbox_extension,
+					band_sigma=band_sigma,
+					min_extent_sigma=min_extent_sigma,
+					return_normals=want_normals,
+				)
+			)
+		)
+
 		pool = concurrent.futures.ThreadPoolExecutor(1)
 		future = pool.submit(prepare, next_shapes())
 		step, log_buffer, union_sizes, t_log = 0, [], [], time.time()
@@ -996,7 +1030,9 @@ def TrainFundamentalFormPredictor(
 			patches = future.result()
 			future = pool.submit(prepare, next_shapes())
 			step_key = jax.random.fold_in(key, step)
-			queries, distances, qnormals = [], [], []
+			queries, distances = [None] * len(patches), [None] * len(patches)
+			qnormals = [None] * len(patches)
+			data = []
 			for j, pt in enumerate(patches):
 				if isinstance(pt[7], str):  # analytic scene: exact-SDF queries
 					E, types, polys, pcount, R = pt[8]
@@ -1013,33 +1049,27 @@ def TrainFundamentalFormPredictor(
 						min_extent_sigma=min_extent_sigma,
 						return_normals=want_normals,
 					)
-					q, d = res[0], res[1]
+					queries[j], distances[j] = res[0], res[1]
 					if want_normals:
-						qnormals.append(res[2])
-					queries.append(q)
-					distances.append(d)
+						qnormals[j] = res[2]
 					union_sizes.append(pt[6])
 					n_analytic += 1
 					continue
-				res = generate_neighborhood_features(
-					jnp.asarray(pt[5]),
-					jnp.asarray(pt[7], jnp.float32),
-					jnp.asarray(pt[8]),
-					jnp.asarray(pt[9]),
-					jax.random.fold_in(step_key, j),
-					n_queries=n_queries_per_neighborhood,
-					narrow_band_offset=narrow_band_offset,
-					bbox_extension=bbox_extension,
-					band_sigma=band_sigma,
-					min_extent_sigma=min_extent_sigma,
-					return_normals=want_normals,
-				)
-				q, d = res[0], res[1]
-				if want_normals:
-					qnormals.append(res[2])
-				queries.append(q)
-				distances.append(d)
+				data.append(j)
 				union_sizes.append(pt[6])
+			if data:
+				stack_data = lambda i, dtype=None: jnp.asarray(np.stack([patches[j][i] for j in data]), dtype)  # noqa: E731
+				res = data_queries(
+					stack_data(5),
+					stack_data(7, jnp.float32),
+					stack_data(8),
+					stack_data(9),
+					jnp.stack([jax.random.fold_in(step_key, j) for j in data]),
+				)
+				for n, j in enumerate(data):
+					queries[j], distances[j] = res[0][n], res[1][n]
+					if want_normals:
+						qnormals[j] = res[2][n]
 			stack = lambda i: jnp.asarray(np.stack([pt[i] for pt in patches]))  # noqa: E731
 			extras = {}
 			if dist_sigma:
@@ -1089,6 +1119,8 @@ def TrainFundamentalFormPredictor(
 				save_checkpoint(f'step{step}')
 				if val_positions is not None:
 					val_loss, val_eikonality_loss = run_validation(jax.random.fold_in(key, 0))
+					validation_losses.append(val_loss)
+					validation_epochs.append(len(all_train_losses) - 1)
 					print(f'	{"validation:":<{LABEL_WIDTH}}{val_loss:<{VALUE_WIDTH}.6f}'
 						f'{"eikonality:":<{LABEL_WIDTH}}{val_eikonality_loss:<{VALUE_WIDTH}.6f}', flush=True)
 					nnx.train_mode(model)
@@ -1350,8 +1382,11 @@ def TrainFundamentalFormPredictor(
 		axes[1, 1].grid(True, alpha=0.3)
 
 	plt.tight_layout()
-	plt.savefig('PlotTrainingHistory.png', dpi=150)
-	print('Training history plot saved to PlotTrainingHistory.png')
+	# Next to the model (the working directory was shared by all phases and runs: each overwrote the last plot)
+	plot_path = os.path.join(models_dir, (final_save_filepath or f'FundamentalFormPredictor_{num_epochs - 1}') + '_history.png')
+	plt.savefig(plot_path, dpi=150)
+	plt.close(fig)
+	print(f'Training history plot saved to {plot_path}')
 
 
 def authors_curriculum(data_dir='datasets', models_dir=MODELS_DIR):
