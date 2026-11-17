@@ -81,7 +81,7 @@ def load_mesh_training_data(filepath):
 # ========================================================================
 
 
-@partial(jit, static_argnames=['knn_blend', 'eikonal_weight'])
+@partial(jit, static_argnames=['knn_blend', 'eikonal_weight', 'lipschitz_from'])
 def SDF_loss(
 	mask,
 	batch_mask,
@@ -94,6 +94,7 @@ def SDF_loss(
 	eikonal_weight=1.0,
 	distance_scale=None,
 	true_normals=None,
+	lipschitz_from=0,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -112,6 +113,8 @@ def SDF_loss(
 		true_normals: None, or (batch_size, n_queries, 3) true SDF gradients (zero where unknown): adds
 			loss_dict['normal_loss'], the mean of 1 - cos(angle(grad phi, true normal)) over the queries with a known
 			normal (--normal-w; not added to the returned loss)
+		lipschitz_from: > 0: queries from this index on (the cube class) get the one-sided penalty max(0, |grad phi| - 1)
+			instead of |1 - |grad phi|| (--lipschitz-cube)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
@@ -132,6 +135,10 @@ def SDF_loss(
 	eikonality_error = jnp.abs(
 		1.0 - jnp.sqrt(jnp.sum(predicted_gradients * predicted_gradients, axis=-1))
 	)  # (batch_size, n_queries,)
+	if lipschitz_from:
+		grad_norm = jnp.sqrt(jnp.sum(predicted_gradients * predicted_gradients, axis=-1))
+		one_sided = jnp.arange(queries.shape[1]) >= lipschitz_from
+		eikonality_error = jnp.where(one_sided[None], jnp.maximum(grad_norm - 1.0, 0.0), eikonality_error)
 	eikonality_valid_mask = ~jnp.isnan(eikonality_error) & batch_mask[:, None]  # (batch_size, n_queries)
 	eikonality_error_masked = jnp.sum(
 		jnp.where(eikonality_valid_mask, eikonality_error, 0.0), axis=-1
@@ -333,7 +340,7 @@ def FundamentalFormPredictorTrainer(
 # ========================================================================
 
 
-def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0):
+def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0, lipschitz_from=0):
 	"""
 	Train step on S patches (augment.make_patch), one per shape: the network runs on the patch unions, and SDF_loss is
 	evaluated per patch (tori and blend restricted to the union) on the queries of the patch centres; the loss is the
@@ -341,6 +348,7 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0):
 	extras: dict of optional per-patch arrays (the flags of the loss): 'dscale' (S, C) factors of the distance errors
 	of each centre's queries (--dist-sigma); 'qnormals' (S, C, n_queries, 3) true SDF gradients of the queries (zero where
 	unknown; --normal-w: the loss gets normal_weight * the mean 1 - cos of their angle with grad phi).
+	lipschitz_from: > 0: one-sided eikonality max(0, |grad phi| - 1) for the queries from this index on (--lipschitz-cube).
 	"""
 
 	@nnx.jit
@@ -357,7 +365,7 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0):
 			_, loss_dict = jax.vmap(
 				lambda m, p, n, c, q, d, ex: SDF_loss(
 					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight,
-					distance_scale=ex.get('dscale'), true_normals=ex.get('qnormals'),
+					distance_scale=ex.get('dscale'), true_normals=ex.get('qnormals'), lipschitz_from=lipschitz_from,
 				)
 			)(Umask, Upos, Unrm, coefficients, queries, true_distances, extras)
 			distance_loss = jnp.mean(loss_dict['distance_loss'])
@@ -413,6 +421,7 @@ def TrainFundamentalFormPredictor(
 	dist_sigma=0.0,
 	normal_weight=0.0,
 	normal_band=False,
+	lipschitz_cube=False,
 ):
 	"""
 	Args:
@@ -457,6 +466,8 @@ def TrainFundamentalFormPredictor(
 			(n: the true surface normal; face normal on meshes, exact SDF gradient on analytic scenes) (0: off)
 		normal_band: the normal term also covers the narrow-band queries with a known true gradient (on meshes: those
 			whose ground-truth distance equals their offset along the face normal; on analytic scenes: all)
+		lipschitz_cube: with multishape: the cube queries get the one-sided Lipschitz penalty max(0, |grad phi| - 1)
+			instead of the two-sided |1 - |grad phi|| (zero-set and band queries keep the two-sided term)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -572,8 +583,10 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
-	if (band_sigma or min_extent_sigma or dist_sigma or normal_weight) and not multishape:
-		raise ValueError('band_sigma, min_extent_sigma, dist_sigma and normal_weight need multi-shape patch batches (multishape > 0)')
+	if (band_sigma or min_extent_sigma or dist_sigma or normal_weight or lipschitz_cube) and not multishape:
+		raise ValueError(
+			'band_sigma, min_extent_sigma, dist_sigma, normal_weight and lipschitz_cube need multi-shape patch batches (multishape > 0)'
+		)
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -704,7 +717,9 @@ def TrainFundamentalFormPredictor(
 		if not max_steps:
 			raise ValueError('multi-shape patch batches need the number of steps of the phase (max_steps)')
 		n_per_type = n_queries_per_neighborhood // 3  # queries: zero set, band, cube (n_per_type each)
-		patch_step = make_patch_step(knn_blend, eikonal_weight, normal_weight)
+		patch_step = make_patch_step(
+			knn_blend, eikonal_weight, normal_weight, lipschitz_from=2 * n_per_type if lipschitz_cube else 0
+		)
 		want_normals = normal_weight > 0
 		normal_mask = np.arange(n_queries_per_neighborhood) < (2 if normal_band else 1) * n_per_type
 		rng = np.random.default_rng(seed + 1000)
@@ -1473,6 +1488,11 @@ def parse_args(argv=None):
 	ap.add_argument(
 		'--normal-band', action='store_true', help='--normal-w also on the narrow-band queries with a known true gradient'
 	)
+	ap.add_argument(
+		'--lipschitz-cube',
+		action='store_true',
+		help='with --multishape: one-sided penalty max(0, |grad phi| - 1) on the cube queries instead of |1 - |grad phi||',
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1531,6 +1551,7 @@ def main(argv=None):
 		dist_sigma=a.dist_sigma,
 		normal_weight=a.normal_w,
 		normal_band=a.normal_band,
+		lipschitz_cube=a.lipschitz_cube,
 	)
 
 
