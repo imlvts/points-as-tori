@@ -23,7 +23,12 @@ All errors are in units of sigma, the median distance to the 64 nearest neighbor
 4. Loss (unless --no-loss): the training loss terms (L1 distance, eikonality) on fixed queries (256 fixed rows per
    shape) of the validation file (DATA_DIR/ABC17_validation_3.npz, unit normals), all-points and 32-NN blend.
 
-The field is the training blend of network.py (geometric sign rule, guard-free log-sum-exp weights) over all points.
+The field (sections 2 and 3) is the training blend of network.py (geometric sign rule, guard-free log-sum-exp
+weights) over the 32 nearest points of each query (--blend-knn 32, default), the rule of the accelerated inference
+(PointsAsTori.signed_distance(accelerate=True), the production field). --blend-knn 0 blends over all points with the
+shift from the 64 nearest (lambda = 128 / d_(64), the evaluation of earlier versions of this script; its numbers are
+not comparable with the 32-NN ones in the columns angAn, angMe, lsH, b999, bmax, far999, sn999). The JSON records
+the blend as 'blend_knn'. Section 1 (curvatures) and section 4 (loss, both blends) do not depend on it.
 
 Gate (logged, never aborts): kerr <= 0.1; analytic normal angle <= 4 deg; sphere k rho within 30 % of -1;
 plane k sigma < 0; snail outward p99.9 < 1 sigma; far-field p99.9 < 0.5 sigma (worst ground-truth shape).
@@ -308,7 +313,7 @@ def curvature_tracking(model, k):
 
 
 # ---------------------------------------------------------------- 2. surface metrics
-def surface_metrics(model, k, n=500):
+def surface_metrics(model, k, n=500, blend_knn=32):
 	rng = np.random.default_rng(11)
 	rows = {}
 	analytic = ('sphere2048', 'sphere8192', 'cyl2048', 'torus4096', 'plane2048')
@@ -327,7 +332,7 @@ def surface_metrics(model, k, n=500):
 		Q, Nt, sq = Q[keep][:n], Nt[keep][:n], sig_i[near][keep][:n]
 		Ht = Ht[keep][:n] if Ht is not None else None
 		C = coeffs(model, P.astype(np.float32), N.astype(np.float32), nb)
-		f = field(P, N, C)
+		f = field(P, N, C, knn=blend_knn)
 		phi, g = f(Q)
 		ang = np.degrees(np.arccos(np.clip(np.sum(g * Nt, 1) / np.maximum(np.linalg.norm(g, axis=1), 1e-12), -1, 1)))
 		row = dict(phi_s=float(np.nanmean(np.abs(phi) / sq)), ang=float(np.nanmean(ang)), ang_p95=float(np.nanpercentile(ang, 95)))
@@ -357,7 +362,7 @@ def _q(e, qs=(50, 90, 99, 99.9, 100)):
 	return [float(x) for x in np.percentile(e, qs)] if len(e) else [float('nan')] * len(qs)
 
 
-def error_distributions(model, k):
+def error_distributions(model, k, blend_knn=32):
 	rng = np.random.default_rng(21)
 	rows = {}
 	for name in ['sphere2048', 'torus4096', 'plane2048', 'cyl2048'] + MESHES:
@@ -372,7 +377,7 @@ def error_distributions(model, k):
 		nb = knn_of(P, k)
 		sig = float(np.median(np.linalg.norm(P[nb] - P[:, None], axis=-1)))
 		B = S + (rng.uniform(-2, 2, len(S)) * sig)[:, None] * NS
-		f = field(P, N, coeffs(model, P, N, nb))
+		f = field(P, N, coeffs(model, P, N, nb), knn=blend_knn)
 		row = {'band_abs': _q(np.abs(f(B)[0] - sdf(B)) / sig)}
 		if not (name.startswith('plane') or name.startswith('cyl')):  # closed shapes only
 			c, h = 0.5 * (P.min(0) + P.max(0)), P.max(0) - P.min(0)
@@ -385,7 +390,7 @@ def error_distributions(model, k):
 	P, N = load_snail()
 	nb = knn_of(P, k)
 	sig_p = np.median(np.linalg.norm(P[nb] - P[:, None], axis=-1), axis=1)
-	f = field(P, N, coeffs(model, P, N, nb))
+	f = field(P, N, coeffs(model, P, N, nb), knn=blend_knn)
 	out = []
 	for delta in (0.5, 1.0):  # outward probes (inward ones cross thin parts of the snail)
 		ph, _ = f(P + delta * sig_p[:, None] * N)
@@ -454,14 +459,15 @@ def gate_report(res):
 	return lines, ok_all
 
 
-def evaluate(path, label=None, out_dir=None, validation_file=None, loss=True):
+def evaluate(path, label=None, out_dir=None, validation_file=None, loss=True, blend_knn=32):
+	"""blend_knn: the blend of sections 2 and 3 (32: the accelerated inference, the default; 0: all points)."""
 	t0 = time.time()
 	model, k = load_model(path)
 	label = label or os.path.splitext(os.path.basename(path))[0]
-	res = dict(model=os.path.abspath(path), label=label)
+	res = dict(model=os.path.abspath(path), label=label, blend_knn=blend_knn)
 	res['curv'], res['curv_rows'] = curvature_tracking(model, k)
-	res['surf'], res['surf_rows'] = surface_metrics(model, k)
-	res['err'], res['err_rows'] = error_distributions(model, k)
+	res['surf'], res['surf_rows'] = surface_metrics(model, k, blend_knn=blend_knn)
+	res['err'], res['err_rows'] = error_distributions(model, k, blend_knn=blend_knn)
 	if loss and validation_file and os.path.exists(validation_file):
 		res['loss'] = loss_eval(model, k, validation_file)
 	res['seconds'] = time.time() - t0
@@ -497,12 +503,19 @@ def main(argv=None):
 	ap.add_argument('--validation-file', default=None, help='default: DATA_DIR/ABC17_validation_3.npz')
 	ap.add_argument('--no-loss', action='store_true', help='skip the loss on fixed validation queries')
 	ap.add_argument('--gate', action='store_true', help='print the gate checks for each model')
+	ap.add_argument(
+		'--blend-knn',
+		type=int,
+		default=32,
+		help='blend of the field metrics: 32 = the accelerated inference (default); 0 = all points (the numbers of earlier versions)',
+	)
 	a = ap.parse_args(argv)
 	vf = a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz')
+	print(f"field blend: {'all points' if a.blend_knn == 0 else f'{a.blend_knn} nearest points'}", flush=True)
 	print(HEAD, flush=True)
 	for m in a.models:
 		label, path = m.split('=', 1) if '=' in m else (None, m)
-		r = evaluate(path, label, a.out, vf, loss=not a.no_loss)
+		r = evaluate(path, label, a.out, vf, loss=not a.no_loss, blend_knn=a.blend_knn)
 		print(row(r), flush=True)
 		if a.gate:
 			for line in gate_report(r)[0]:

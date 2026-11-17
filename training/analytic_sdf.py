@@ -118,23 +118,30 @@ def sdf_grad(q, prims, types, polys, pcount):
 	return jax.vmap(jax.value_and_grad(f))(q)
 
 
-def _boxes(nbp, bbox_extension):
+def _boxes(nbp, bbox_extension, min_extent=0.1):
 	bmin, bmax = nbp.min(1), nbp.max(1)
 	c = 0.5 * (bmin + bmax)
-	ext = jnp.maximum(jnp.abs(bmax - bmin), 0.1)
+	ext = jnp.maximum(jnp.abs(bmax - bmin), jnp.reshape(min_extent, (-1, 1)))
 	side = jnp.maximum(jnp.max(jnp.abs(bmax - bmin), axis=-1), 0.01)
 	rad = 0.5 * jnp.sqrt(3.0) * side * bbox_extension
 	return c - 0.5 * ext, c + 0.5 * ext, c - rad[:, None], c + rad[:, None]
 
 
-@partial(jax.jit, static_argnames=['n_queries', 'n_cand'])
-def analytic_queries(nbp, prims, types, polys, pcount, R, key, bbox_extension=1.0, n_queries=120, n_cand=512):
+@partial(jax.jit, static_argnames=['n_queries', 'n_cand', 'return_normals'])
+def analytic_queries(nbp, prims, types, polys, pcount, R, key, bbox_extension=1.0, n_queries=120, n_cand=512,
+					 band_sigma=0.0, min_extent_sigma=0.0, return_normals=False):
 	"""The local query sampler (mesh_sampling_jax.sample_zero_set_and_band_local) with an exact-SDF ground truth (no mesh). Per neighbourhood (rows of nbp, world frame):
     zero-set = uniform candidates in the regularised box projected onto the surface (x - phi grad phi, exact closest
     point for an exact SDF), kept if inside the box; band = zero + U(-0.2, 0.2) * grad phi, kept if inside the cube box;
-    cube = uniform in the cube box. SDF exact. R: rotation used for the cloud (world = shape @ R.T)."""
+    cube = uniform in the cube box. SDF exact. R: rotation used for the cloud (world = shape @ R.T).
+    band_sigma, min_extent_sigma > 0: band half-width and minimum box extent relative to the neighbourhood's sigma
+    (median distance to its row 0), as in mesh_sampling_jax.generate_queries_for_neighborhood (0: 0.2 and 0.1).
+    return_normals: also return the exact SDF gradients (world frame) at the zero-set and band queries (zero for the
+    cube queries and fallbacks): q, d, normals, fallback fraction."""
 	m = n_queries // 3
-	rlo, rhi, clo, chi = _boxes(nbp, bbox_extension)
+	sig = jnp.median(jnp.linalg.norm(nbp - nbp[:, :1], axis=-1), axis=1)  # (n,)
+	half = jnp.where(band_sigma > 0, band_sigma * sig, 0.2)
+	rlo, rhi, clo, chi = _boxes(nbp, bbox_extension, jnp.where(min_extent_sigma > 0, min_extent_sigma * sig, 0.1))
 	keys = jax.random.split(key, nbp.shape[0])
 
 	def phi_g(x):  # world-frame values and gradients
@@ -147,7 +154,7 @@ def analytic_queries(nbp, prims, types, polys, pcount, R, key, bbox_extension=1.
 		na = jnp.sum(ok)
 		return order[jnp.arange(n) % jnp.maximum(na, 1)], na
 
-	def one(lo, hi, cl, ch, pts, kk):
+	def one(lo, hi, cl, ch, pts, kk, hw):
 		k1, k2, k3, k4, k5 = jax.random.split(kk, 5)
 		x = lo + jax.random.uniform(k1, (n_cand, 3)) * (hi - lo)
 		v, g = phi_g(x)
@@ -156,15 +163,21 @@ def analytic_queries(nbp, prims, types, polys, pcount, R, key, bbox_extension=1.
 		okz = jnp.all((z >= lo) & (z <= hi), -1) & jnp.all(jnp.isfinite(z), -1)
 		iz, nz = pick(okz, k2, m)
 		_, gz = phi_g(z)
-		y = z + jax.random.uniform(k3, (n_cand,), minval=-0.2, maxval=0.2)[:, None] * gz
+		y = z + jax.random.uniform(k3, (n_cand,), minval=-hw, maxval=hw)[:, None] * gz
 		okb = okz & jnp.all((y >= cl) & (y <= ch), -1)
 		ib, nb_ = pick(okb, k4, m)
 		fall = pts[jnp.arange(m) % pts.shape[0]]
 		zq = jnp.where(nz > 0, z[iz], fall)
 		bq = jnp.where(nb_ > 0, y[ib], fall)
 		cq = cl + jax.random.uniform(k5, (n_queries - 2 * m, 3)) * (ch - cl)
-		return jnp.concatenate([zq, bq, cq], 0), nz == 0
+		nrm = None
+		if return_normals:
+			_, gb = phi_g(y[ib])
+			nrm = jnp.concatenate([jnp.where(nz > 0, gz[iz], 0.0), jnp.where(nb_ > 0, gb, 0.0), jnp.zeros_like(cq)], 0)
+		return jnp.concatenate([zq, bq, cq], 0), nz == 0, nrm
 
-	q, f0 = jax.vmap(one)(rlo, rhi, clo, chi, nbp, keys)
+	q, f0, nrm = jax.vmap(one)(rlo, rhi, clo, chi, nbp, keys, half)
 	d = jax.vmap(lambda qq: sdf(qq @ R, prims, types, polys, pcount))(q)
+	if return_normals:
+		return q, d, nrm, jnp.mean(f0)
 	return q, d, jnp.mean(f0)
