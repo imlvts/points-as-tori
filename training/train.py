@@ -479,6 +479,7 @@ def TrainFundamentalFormPredictor(
 	carry_opt=False,
 	ema=0.0,
 	normal_noise=0.0,
+	holes='',
 ):
 	"""
 	Args:
@@ -506,6 +507,8 @@ def TrainFundamentalFormPredictor(
 			and continues the EMA from the model's (0: off)
 		normal_noise: with multishape: angular noise of normal_noise degrees on the input normals of every visit (data
 			shapes and analytic scenes; the ground truth stays exact; --aux-curv then drops its tilt terms) (0: off)
+		holes: 'P:R' with multishape: with probability P per patch, cut a hole of radius R sigma next to the seed
+			(augment.make_patch; the ground truth stays complete) ('': off)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -711,8 +714,11 @@ def TrainFundamentalFormPredictor(
 	total_shapes = len(all_shape_indices)
 	if resample and not multishape:
 		raise ValueError('resample needs multi-shape patch batches (multishape > 0)')
-	if (noise or quantize or normal_noise) and not multishape:
-		raise ValueError('noise, quantize and normal_noise need multi-shape patch batches (multishape > 0)')
+	if (noise or quantize or normal_noise or holes) and not multishape:
+		raise ValueError('noise, quantize, normal_noise and holes need multi-shape patch batches (multishape > 0)')
+	hole = tuple(float(x) for x in holes.split(':')) if holes else None
+	if hole is not None and len(hole) != 2:
+		raise ValueError(f'holes {holes!r}: expected PROBABILITY:RADIUS')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
 	if aux_curv and not mix:
@@ -901,7 +907,7 @@ def TrainFundamentalFormPredictor(
 				N = augment.perturb_normals(N, normal_noise, rng)
 			patch, curv = augment.make_patch(
 				P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng,
-				point_data=np.stack([k1, k2], -1),
+				point_data=np.stack([k1, k2], -1), hole=hole,
 			)
 			return patch + ('analytic', (E, types, polys, pcount, R), {'curv': curv})
 
@@ -924,7 +930,7 @@ def TrainFundamentalFormPredictor(
 				P, N, NB, M, V, F, FM, tree = augment.visit(
 					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise
 				)
-				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
+				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole)
 				patches.append(patch + (V, F, FM, {}))
 			return patches
 
@@ -1652,6 +1658,13 @@ def parse_args(argv=None):
 		help='with --multishape: angular noise of DEG degrees (std of each tangent component) on the input normals (0: off)',
 	)
 	ap.add_argument(
+		'--holes',
+		default='',
+		metavar='P:R',
+		help='with --multishape: with probability P per patch, remove the input points of a ball of radius R sigma next to '
+		'the patch seed (the ground truth stays complete; default: off)',
+	)
+	ap.add_argument(
 		'--mix',
 		default='',
 		metavar='analytic:FRAC:PATH',
@@ -1770,6 +1783,7 @@ def main(argv=None):
 		carry_opt=a.carry_opt,
 		ema=a.ema,
 		normal_noise=a.normal_noise,
+		holes=a.holes,
 	)
 
 

@@ -91,13 +91,17 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 	return P, N, NB, M, V, F, FM, tree
 
 
-def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None):
+def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole=None):
 	"""
 	Args:
 		P, N: (n, 3) points and normals; NB: (n, k) neighbors or None (then tree, a cKDTree of P, gives them);
 		M: (n,) valid-point mask; rng: numpy Generator.
 		point_data: None, or (n, m) per-point values; then the result is (the tuple below, (upad, m) their values on
 			U, padded like Upos)
+		hole: None, or (p, r): with probability p, cut a hole next to the seed before the centres are chosen: the points
+			within r sigma of P[seed] + (r + 0.5) sigma t are removed (t a random unit tangent at the seed, sigma the
+			median distance of the seed's k-NN), so the hole's rim runs through the patch; the k-NN are recomputed.
+			The ground truth (mesh / exact SDF) is not changed: the network learns to close the gap.
 
 	Returns:
 		UP, UN: (upad, k, 3) network inputs (neighborhoods of the points of U)
@@ -108,6 +112,23 @@ def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None):
 	"""
 	valid = np.nonzero(M)[0]
 	seed = int(rng.choice(valid))
+	if hole is not None and rng.uniform() < hole[0]:
+		nbs = NB[seed] if NB is not None else tree.query(P[seed], k=k)[1]
+		sigma = float(np.median(np.linalg.norm(P[nbs] - P[seed], axis=-1)))
+		n = N[seed] / max(np.linalg.norm(N[seed]), 1e-12)
+		t = rng.normal(size=3)
+		t -= (t @ n) * n
+		t /= max(np.linalg.norm(t), 1e-12)
+		c = P[seed] + (hole[1] + 0.5) * sigma * t
+		keep = np.asarray(M, bool) & (np.linalg.norm(P - c, axis=-1) > hole[1] * sigma)
+		keep[seed] = True
+		if keep.sum() >= 2 * k:  # (skipped on clouds too small to keep k-NN)
+			idx = np.nonzero(keep)[0]
+			P, N = P[idx], N[idx]
+			if point_data is not None:
+				point_data = point_data[idx]
+			seed = int(np.searchsorted(idx, seed))
+			M, NB, tree = np.ones(len(idx), bool), None, cKDTree(P)
 	if NB is not None:
 		centres = NB[seed][:n_centres]
 		U = np.unique(NB[centres].ravel())
