@@ -290,6 +290,9 @@ double TorusDistanceField::evaluate_distance_single(const Eigen::Vector3d& q, co
         if (use_areas) {
             weight *= areas(i);
         }
+        if (point_weights.size() == n_points) {
+            weight *= point_weights(i);
+        }
         Eigen::Vector3d center = centers.col(i);
         double g_z = torus_signed_distance(q, center, axes.col(i), major_radii(i), minor_radii(i));
         g += weight * g_z;
@@ -375,6 +378,9 @@ std::tuple<double, Eigen::Vector3d, double> TorusDistanceField::evaluate_distanc
         double weight = std::exp(-lam * (d - shift));
         if (use_areas) {
             weight *= areas(i);
+        }
+        if (point_weights.size() == n_points) {
+            weight *= point_weights(i);
         }
         Eigen::Vector3d center = centers.col(i);
         Eigen::Vector3d cVec = q - center;
@@ -1435,6 +1441,8 @@ void bind_torus_distance(nb::module_& m) {
         .def("set_lambda_scale", &TorusDistanceField::set_lambda_scale, "scale"_a,
              "Scale the (automatically-computed) parameter λ")
         .def("set_outliers", &TorusDistanceField::set_outliers, "indices"_a, "Mark outliers")
+        .def("set_point_weights", &TorusDistanceField::set_point_weights, "weights"_a,
+             "Per-point confidence multiplying each torus' blend weight (empty: none)")
 
         .def("get_neighbors", &TorusDistanceField::get_neighbors, "k_neighbors"_a, "i"_a, "Get nearest neighbors")
         .def("get_neighbors", &TorusDistanceField::get_all_neighbors, "k_neighbors"_a, "Get nearest neighbors")

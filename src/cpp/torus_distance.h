@@ -323,6 +323,11 @@ class TorusDistanceField {
     void set_lambda_scale(float scale) {
         lambda_scale = scale;
     }
+    // Per-point confidence multiplying each torus' blend weight (the --aux-heads confidence of the trained network);
+    // empty (the default) or of a different size: no weights.
+    void set_point_weights(const Eigen::VectorXd& w) {
+        point_weights = w;
+    }
 
     Eigen::VectorXd get_point_areas() {
         if (areas.size() == 0) {
@@ -359,6 +364,7 @@ class TorusDistanceField {
     double radius_evaluation = -1.0; // radius for radius-based evaluation (-1 = disabled, use k_evaluation)
     double lambda_scale = 1.0;
     Eigen::VectorXi is_outlier;
+    Eigen::VectorXd point_weights; // set_point_weights
 
     // torus parameters
     Eigen::Matrix<double, 3, Eigen::Dynamic> centers;
