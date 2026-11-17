@@ -340,7 +340,37 @@ def FundamentalFormPredictorTrainer(
 # ========================================================================
 
 
-def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0, lipschitz_from=0):
+def curvature_aux_loss(coefficients, neighborhoods, target, mask, tilt=True):
+	"""
+	Auxiliary loss on the predicted quadrics of points with known curvatures (--aux-curv; analytic scenes).
+
+	coefficients: (n, 6) predicted (a00, a01, a10, a11, a02, a20) in world units; neighborhoods: (n, k, 3) the network
+	inputs (row 0 the point; sigma = median distance to it, the network's scale); target: (n, 2) true principal
+	curvatures (k1, k2) in the sign convention of eval_model.curvatures (convex with outward normal < 0); mask: (n,).
+	Per point, in units of sigma: |H sigma - H_t sigma| + |D sigma - D_t sigma| + |a00| / sigma (+ |a01| + |a10| if
+	tilt), H the mean curvature and D = |k1 - k2| / 2 of the quadric (from the shape operator I^-1 II, as in
+	torus_precompute_masked), so the order of k1, k2 does not matter. Mean over the masked points.
+	"""
+	a00, a01, a10, a11, a02, a20 = (coefficients[:, i] for i in range(6))
+	sigma = jnp.median(jnp.linalg.norm(neighborhoods - neighborhoods[:, :1], axis=-1), axis=-1)
+	sigma = jnp.where(sigma > 0, sigma, 1.0)
+	det_I = 1.0 + a01**2 + a10**2
+	A = jnp.sqrt(det_I)
+	I11, I12, I22 = 1.0 + a10**2, a10 * a01, 1.0 + a01**2
+	II11, II12, II22 = 2.0 * a20 / A, a11 / A, 2.0 * a02 / A
+	Hs = sigma * (I22 * II11 - 2.0 * I12 * II12 + I11 * II22) / (2.0 * det_I)
+	Ks = sigma**2 * (II11 * II22 - II12**2) / det_I
+	Ds = jnp.sqrt(jnp.maximum(Hs**2 - Ks, 0.0) + 1e-8)
+	Ht = 0.5 * (target[:, 0] + target[:, 1]) * sigma
+	Dt = 0.5 * jnp.abs(target[:, 0] - target[:, 1]) * sigma
+	err = jnp.abs(Hs - Ht) + jnp.abs(Ds - Dt) + jnp.abs(a00) / sigma
+	if tilt:
+		err = err + jnp.abs(a01) + jnp.abs(a10)
+	err = jnp.where(mask & jnp.isfinite(err), err, 0.0)
+	return jnp.sum(err) / jnp.maximum(jnp.sum(mask), 1)
+
+
+def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0, lipschitz_from=0, aux_weight=0.0, aux_tilt=True):
 	"""
 	Train step on S patches (augment.make_patch), one per shape: the network runs on the patch unions, and SDF_loss is
 	evaluated per patch (tori and blend restricted to the union) on the queries of the patch centres; the loss is the
@@ -349,6 +379,8 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0, lipschit
 	of each centre's queries (--dist-sigma); 'qnormals' (S, C, n_queries, 3) true SDF gradients of the queries (zero where
 	unknown; --normal-w: the loss gets normal_weight * the mean 1 - cos of their angle with grad phi).
 	lipschitz_from: > 0: one-sided eikonality max(0, |grad phi| - 1) for the queries from this index on (--lipschitz-cube).
+	aux_weight: > 0: add aux_weight * curvature_aux_loss over the union points with known curvatures (extras 'aux_t'
+	(S, U, 2) true principal curvatures, 'aux_m' (S, U) mask; --aux-curv); aux_tilt: include the tilt terms.
 	"""
 
 	@nnx.jit
@@ -375,6 +407,15 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0, lipschit
 			if 'normal_loss' in loss_dict:
 				out['normal_loss'] = jnp.mean(loss_dict['normal_loss'])
 				loss = loss + normal_weight * out['normal_loss']
+			if aux_weight:
+				out['aux_loss'] = curvature_aux_loss(
+					coefficients.reshape(S * U, 6),
+					UP.reshape(S * U, K, 3),
+					extras['aux_t'].reshape(S * U, 2),
+					(extras['aux_m'] & Umask).reshape(S * U),
+					tilt=aux_tilt,
+				)
+				loss = loss + aux_weight * out['aux_loss']
 			return loss, out
 
 		(loss, loss_dict), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
@@ -422,6 +463,7 @@ def TrainFundamentalFormPredictor(
 	normal_weight=0.0,
 	normal_band=False,
 	lipschitz_cube=False,
+	aux_curv=0.0,
 ):
 	"""
 	Args:
@@ -468,6 +510,9 @@ def TrainFundamentalFormPredictor(
 			whose ground-truth distance equals their offset along the face normal; on analytic scenes: all)
 		lipschitz_cube: with multishape: the cube queries get the one-sided Lipschitz penalty max(0, |grad phi| - 1)
 			instead of the two-sided |1 - |grad phi|| (zero-set and band queries keep the two-sided term)
+		aux_curv: with mix: add aux_curv * curvature_aux_loss over all union points of the analytic patches (exact
+			principal curvatures of analytic_scene.sample_scene / gen_analytic.py; contact offset a00 = 0 and tilt
+			a01 = a10 = 0 for exact input points and normals) (0: off)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -583,6 +628,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
+	if aux_curv and not mix:
+		raise ValueError('aux_curv needs analytic patches (mix)')
 	if (band_sigma or min_extent_sigma or dist_sigma or normal_weight or lipschitz_cube) and not multishape:
 		raise ValueError(
 			'band_sigma, min_extent_sigma, dist_sigma, normal_weight and lipschitz_cube need multi-shape patch batches (multishape > 0)'
@@ -718,7 +765,11 @@ def TrainFundamentalFormPredictor(
 			raise ValueError('multi-shape patch batches need the number of steps of the phase (max_steps)')
 		n_per_type = n_queries_per_neighborhood // 3  # queries: zero set, band, cube (n_per_type each)
 		patch_step = make_patch_step(
-			knn_blend, eikonal_weight, normal_weight, lipschitz_from=2 * n_per_type if lipschitz_cube else 0
+			knn_blend,
+			eikonal_weight,
+			normal_weight,
+			lipschitz_from=2 * n_per_type if lipschitz_cube else 0,
+			aux_weight=aux_curv,
 		)
 		want_normals = normal_weight > 0
 		normal_mask = np.arange(n_queries_per_neighborhood) < (2 if normal_band else 1) * n_per_type
@@ -742,13 +793,16 @@ def TrainFundamentalFormPredictor(
 			E, types, polys, pcount = scenes['prims'][i], scenes['types'][i], scenes['polys'][i], scenes['pcount'][i]
 			if resample:
 				n = int(rng.choice(augment.resample_counts(resample)))
-				P, N, _, _, _, _ = analytic_scene.sample_scene(analytic_scene.decode(E, types, polys, pcount), n, rng)
+				P, N, k1, k2, _, _ = analytic_scene.sample_scene(analytic_scene.decode(E, types, polys, pcount), n, rng)
 			else:
-				P, N = scenes['P'][i], scenes['N'][i]
+				P, N, k1, k2 = scenes['P'][i], scenes['N'][i], scenes['k1'][i], scenes['k2'][i]
 			R = augment.random_rotation(rng) if rotate else np.eye(3)
 			P, N = P @ R.T, N @ R.T
-			patch = augment.make_patch(P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng)
-			return patch + ('analytic', (E, types, polys, pcount, R))
+			patch, curv = augment.make_patch(
+				P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng,
+				point_data=np.stack([k1, k2], -1),
+			)
+			return patch + ('analytic', (E, types, polys, pcount, R), {'curv': curv})
 
 		def next_shapes():
 			nonlocal stream
@@ -770,7 +824,7 @@ def TrainFundamentalFormPredictor(
 					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize
 				)
 				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
-				patches.append(patch + (V, F, FM))
+				patches.append(patch + (V, F, FM, {}))
 			return patches
 
 		pool = concurrent.futures.ThreadPoolExecutor(1)
@@ -833,6 +887,11 @@ def TrainFundamentalFormPredictor(
 				extras['dscale'] = jnp.asarray(dist_sigma / np.maximum(sig_c, 1e-12), jnp.float32)
 			if want_normals:
 				extras['qnormals'] = jnp.stack(qnormals) * jnp.asarray(normal_mask[:, None], jnp.float32)
+			if aux_curv:
+				extras['aux_t'] = jnp.asarray(
+					np.stack([pt[-1].get('curv', np.zeros((union_size, 2), np.float32)) for pt in patches]), jnp.float32
+				)
+				extras['aux_m'] = jnp.asarray(np.stack([np.full(union_size, 'curv' in pt[-1]) for pt in patches]))
 			loss, loss_dict = patch_step(
 				model,
 				optimizer,
@@ -1493,6 +1552,15 @@ def parse_args(argv=None):
 		action='store_true',
 		help='with --multishape: one-sided penalty max(0, |grad phi| - 1) on the cube queries instead of |1 - |grad phi||',
 	)
+	ap.add_argument(
+		'--aux-curv',
+		type=float,
+		default=0.0,
+		metavar='W',
+		help='with --mix: add W * an L1 loss on the predicted quadrics of all union points of the analytic patches '
+		'(mean curvature and |k1 - k2|/2 in units of 1/sigma, contact offset a00/sigma, tilt a01, a10; exact values from '
+		'the analytic scenes) (0: off)',
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1552,6 +1620,7 @@ def main(argv=None):
 		normal_weight=a.normal_w,
 		normal_band=a.normal_band,
 		lipschitz_cube=a.lipschitz_cube,
+		aux_curv=a.aux_curv,
 	)
 
 

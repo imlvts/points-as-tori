@@ -76,11 +76,13 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 	return P, N, NB, M, V, F, FM, tree
 
 
-def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng):
+def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None):
 	"""
 	Args:
 		P, N: (n, 3) points and normals; NB: (n, k) neighbors or None (then tree, a cKDTree of P, gives them);
 		M: (n,) valid-point mask; rng: numpy Generator.
+		point_data: None, or (n, m) per-point values; then the result is (the tuple below, (upad, m) their values on
+			U, padded like Upos)
 
 	Returns:
 		UP, UN: (upad, k, 3) network inputs (neighborhoods of the points of U)
@@ -109,7 +111,10 @@ def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng):
 	nbUf = np.concatenate([nbU, np.repeat(nbU[:1], pad, 0)])
 	mask = np.arange(upad) < len(U)
 	f32 = lambda x: np.asarray(x, np.float32)  # noqa: E731
-	return f32(P[nbUf]), f32(N[nbUf]), f32(P[Uf]), f32(N[Uf]), mask, f32(P[nbC]), u
+	out = f32(P[nbUf]), f32(N[nbUf]), f32(P[Uf]), f32(N[Uf]), mask, f32(P[nbC]), u
+	if point_data is not None:
+		return out, f32(point_data[Uf])
+	return out
 
 
 def resample_counts(spec):
