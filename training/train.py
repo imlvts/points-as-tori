@@ -384,6 +384,8 @@ def TrainFundamentalFormPredictor(
 	noise=0.0,
 	quantize=0.0,
 	mix='',
+	band_sigma=0.0,
+	min_extent_sigma=0.0,
 ):
 	"""
 	Args:
@@ -415,6 +417,11 @@ def TrainFundamentalFormPredictor(
 		mix: 'analytic:FRAC:PATH' with multishape: each patch slot is, with probability FRAC, a patch of an analytic scene
 			of PATH (gen_analytic.py) with exact-SDF queries (analytic_sdf.analytic_queries) instead of a data shape;
 			resample and rotate apply to the analytic scenes too ('': off)
+		band_sigma: with multishape: the narrow-band queries are offset by U(-b, b) along the normal with b = band_sigma *
+			sigma_c, sigma_c the median distance of the centre's k-NN to it (the network's scale), instead of b = 0.2
+			world units (0: off)
+		min_extent_sigma: with multishape: the minimum extent of a centre's query box is min_extent_sigma * sigma_c
+			instead of 0.1 world units (0: off)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -530,6 +537,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
+	if (band_sigma or min_extent_sigma) and not multishape:
+		raise ValueError('band_sigma and min_extent_sigma need multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -732,6 +741,8 @@ def TrainFundamentalFormPredictor(
 						jnp.asarray(R, jnp.float32),
 						jax.random.fold_in(step_key, j),
 						bbox_extension=bbox_extension,
+						band_sigma=band_sigma,
+						min_extent_sigma=min_extent_sigma,
 					)
 					queries.append(q)
 					distances.append(d)
@@ -747,6 +758,8 @@ def TrainFundamentalFormPredictor(
 					n_queries=n_queries_per_neighborhood,
 					narrow_band_offset=narrow_band_offset,
 					bbox_extension=bbox_extension,
+					band_sigma=band_sigma,
+					min_extent_sigma=min_extent_sigma,
 				)
 				queries.append(q)
 				distances.append(d)
@@ -1362,6 +1375,21 @@ def parse_args(argv=None):
 		help='with --multishape: each patch is, with probability FRAC, from an analytic scene of PATH (gen_analytic.py) '
 		'with exact-SDF queries (default: off)',
 	)
+	ap.add_argument(
+		'--band-sigma',
+		type=float,
+		default=0.0,
+		metavar='B',
+		help='with --multishape: narrow-band queries offset by U(-B, B) sigma_c along the normal (sigma_c: median distance '
+		'of the centre\'s k-NN) instead of U(-0.2, 0.2) world units (0: off)',
+	)
+	ap.add_argument(
+		'--min-extent-sigma',
+		type=float,
+		default=0.0,
+		metavar='M',
+		help='with --multishape: minimum extent of a query box M sigma_c instead of 0.1 world units (0: off)',
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1415,6 +1443,8 @@ def main(argv=None):
 		noise=a.noise,
 		quantize=a.quantize,
 		mix=a.mix,
+		band_sigma=a.band_sigma,
+		min_extent_sigma=a.min_extent_sigma,
 	)
 
 
