@@ -92,6 +92,7 @@ def SDF_loss(
 	true_distances,
 	knn_blend=0,
 	eikonal_weight=1.0,
+	aux=None,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -106,12 +107,14 @@ def SDF_loss(
 		true_distances: (batch_size, n_queries,)
 		knn_blend: blend over the knn_blend nearest points of each query (0: all points; see torus_distance_gradient_masked)
 		eikonal_weight: weight of the eikonality term (the distance term has weight 1)
+		aux: None or (max_points, 2) --aux-heads logits (flip, confidence) of the points (network.aux_blend_terms)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
 
+	sign, log_weight = (None, None) if aux is None else aux_blend_terms(aux)
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
+		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend, point_sign=sign, log_weight=log_weight
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -161,11 +164,13 @@ def validation_loss(
 	queries,
 	true_distances,
 	knn_blend=0,
+	aux=None,
 ):
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
 
+	sign, log_weight = (None, None) if aux is None else aux_blend_terms(aux, hard=True)
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
+		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend, point_sign=sign, log_weight=log_weight
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -281,7 +286,10 @@ def FundamentalFormPredictorTrainer(
 		"""
 
 		def loss_fn(model):
-			coefficients = model(positions[neighbors], normals[neighbors])
+			if model.arch['aux_heads']:
+				coefficients, aux = model.predict(positions[neighbors], normals[neighbors])
+			else:
+				coefficients, aux = model(positions[neighbors], normals[neighbors]), None
 
 			loss, loss_dict = SDF_loss(
 				mask,
@@ -293,6 +301,7 @@ def FundamentalFormPredictorTrainer(
 				true_distances,
 				knn_blend=knn_blend,
 				eikonal_weight=eikonal_weight,
+				aux=aux,
 			)
 
 			return loss, loss_dict
@@ -337,12 +346,19 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0):
 		batch_mask = jnp.ones(queries.shape[1], bool)
 
 		def loss_fn(model):
-			coefficients = model(UP.reshape(S * U, K, 3), UN.reshape(S * U, K, 3)).reshape(S, U, 6)
+			flat = (UP.reshape(S * U, K, 3), UN.reshape(S * U, K, 3))
+			if model.arch['aux_heads']:
+				coefficients, aux = model.predict(*flat)
+				aux = aux.reshape(S, U, -1)
+			else:
+				coefficients, aux = model(*flat), None
+			coefficients = coefficients.reshape(S, U, 6)
 			_, loss_dict = jax.vmap(
-				lambda m, p, n, c, q, d: SDF_loss(
-					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight
-				)
-			)(Umask, Upos, Unrm, coefficients, queries, true_distances)
+				lambda m, p, n, c, q, d, a: SDF_loss(
+					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight, aux=a
+				),
+				in_axes=(0, 0, 0, 0, 0, 0, None if aux is None else 0),
+			)(Umask, Upos, Unrm, coefficients, queries, true_distances, aux)
 			distance_loss = jnp.mean(loss_dict['distance_loss'])
 			eikonality_loss = jnp.mean(loss_dict['eikonality_loss'])
 			loss = distance_loss + eikonal_weight * eikonality_loss
@@ -624,7 +640,10 @@ def TrainFundamentalFormPredictor(
 			)
 
 			# Compute weights for this validation shape
-			val_weights = model(val_pos[val_neigh], val_norm[val_neigh])
+			if model.arch['aux_heads']:
+				val_weights, val_aux = model.predict(val_pos[val_neigh], val_norm[val_neigh])
+			else:
+				val_weights, val_aux = model(val_pos[val_neigh], val_norm[val_neigh]), None
 
 			# Compute loss per batch
 			n_val_batches = (val_pos.shape[0] + batch_size - 1) // batch_size
@@ -648,6 +667,7 @@ def TrainFundamentalFormPredictor(
 						batch_queries,
 						batch_distances,
 						knn_blend=knn_blend,
+						aux=val_aux,
 					)
 					batch_val_losses.append(val_loss)
 					batch_val_eikonality_losses.append(val_eikonality_loss)
@@ -1413,6 +1433,14 @@ def parse_args(argv=None):
 	)
 	ap.add_argument('--wls-bound', type=float, default=1.0, help='--wls: residual bound (units of the median distance)')
 	ap.add_argument(
+		'--aux-heads',
+		action='store_true',
+		help='architecture: two more outputs per point, a normal-flip logit (the torus SDF is negated where < 0; '
+		'straight-through sign in training) and a confidence logit (log sigmoid added to the point\'s blend exponent). '
+		'Only useful with corrupted inputs. Saved with the model; infer.py applies '
+		'both heads',
+	)
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1465,7 +1493,7 @@ def main(argv=None):
 
 def arch_options(a):
 	"""The architecture options of the command line that differ from the authors' network (network.ARCH_DEFAULTS)."""
-	opts = dict(frame=a.frame, input_mlp=a.input_mlp, encoder=a.encoder, wls=a.wls)
+	opts = dict(frame=a.frame, input_mlp=a.input_mlp, encoder=a.encoder, wls=a.wls, aux_heads=a.aux_heads)
 	if a.wls:
 		opts.update(wls_bound=a.wls_bound)
 	if a.encoder == 'perceiver':

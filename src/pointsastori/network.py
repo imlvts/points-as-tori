@@ -159,6 +159,22 @@ def invariant_frames(positions: jnp.ndarray, s_hat: jnp.ndarray, t_hat: jnp.ndar
 	return angles, weights / jnp.sum(weights, axis=-1, keepdims=True)
 
 
+def aux_blend_terms(aux: jnp.ndarray, hard: bool = False):
+	"""
+	--aux-heads logits [..., 2] -> (point_sign, log_weight) of torus_distance_gradient_masked.
+	point_sign: the torus' SDF is negated (the point's normal is taken as flipped) where the flip logit is < 0. In
+	training a straight-through estimate: the value is exactly +-1 (as at inference), the gradient that of tanh.
+	log_weight = log sigmoid(confidence logit) <= 0: the log of the point's confidence alpha in (0, 1), which multiplies
+	its blend weight (only ratios matter: the blend is normalized). hard: no straight-through term (inference).
+	"""
+	z_flip, z_conf = aux[..., 0], aux[..., 1]
+	sign = jnp.where(z_flip >= 0, 1.0, -1.0)
+	if not hard:
+		soft = jnp.tanh(z_flip)
+		sign = sign + soft - jax.lax.stop_gradient(soft)
+	return sign, jax.nn.log_sigmoid(z_conf)
+
+
 def rotate_coeffs(c: jnp.ndarray, cos_phi: jnp.ndarray, sin_phi: jnp.ndarray) -> jnp.ndarray:
 	"""
 	Coefficients (a00, a01, a10, a11, a02, a20) of the height h = a00 + a10 s' + a01 t' + a20 s'^2 + a11 s' t' + a02 t'^2
@@ -485,6 +501,8 @@ def torus_distance_gradient_masked(
 	major_radii: jnp.ndarray,
 	minor_radii: jnp.ndarray,
 	knn: int = 0,
+	point_sign: jnp.ndarray = None,
+	log_weight: jnp.ndarray = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 	"""
 	Only sum over torii at valid points (where mask is True).
@@ -502,6 +520,8 @@ def torus_distance_gradient_masked(
 		axes: (max_points, 2) - torii axes
 		major_radii: (max_points,)
 		minor_radii: (max_points,)
+		point_sign: None or (max_points,) multiplier of each torus' signed distance and gradient (+-1: --aux-heads flip)
+		log_weight: None or (max_points,) added to each torus' blend exponent (log of its confidence: --aux-heads)
 
 	Returns:
 		distances: (batch_size, n_queries,) array of signed distances
@@ -541,6 +561,8 @@ def torus_distance_gradient_masked(
 		axis_i = axis3d[nearest]
 		R_i = major_radii[nearest]
 		r_i = minor_radii[nearest]
+		sign_i = None if point_sign is None else point_sign[nearest]
+		logw_i = None if log_weight is None else log_weight[nearest]
 	else:
 		# Broadcast points, centers, etc. for all queries
 		# (1, 1, max_points, 3)
@@ -557,6 +579,8 @@ def torus_distance_gradient_masked(
 		R_i = major_radii[None, None, :]
 		r_i = minor_radii[None, None, :]
 		mask_i = valid_torus_mask[None, None, :]  # (1, 1, max_points)
+		sign_i = None if point_sign is None else point_sign[None, None, :]
+		logw_i = None if log_weight is None else log_weight[None, None, :]
 	lam = compute_lambdas_jax(shifts)  # (batch_size, n_queries)
 
 	# Distance from query to torus center
@@ -619,6 +643,9 @@ def torus_distance_gradient_masked(
 	grad_z = jnp.where(mask_i, grad_z, 0.0)
 
 	grad_g = jnp.stack([grad_x, grad_y, grad_z], axis=-1)  # (batch, n_queries, max_points, 3)
+	if sign_i is not None:
+		g_z = sign_i * g_z
+		grad_g = sign_i[..., None] * grad_g
 
 	# Compute exponential weights
 	rHat = rVec / jnp.maximum(dist_to_point, NAN_EPSILON)[:, :, :, None]
@@ -632,6 +659,8 @@ def torus_distance_gradient_masked(
 	# from the 64-NN of the query while the sum ran over all points, so for queries beyond ~0.9x the 64-NN radius every
 	# weight underflowed, sum(w) < 1e-10, and the guard returned phi ~ 0 with a meaningless gradient there.
 	exponent = -lam_expanded * (dist_to_point - shift_expanded)  # (batch, n_queries, max_points)
+	if logw_i is not None:
+		exponent = exponent + logw_i
 	exponent_max = jnp.max(jnp.where(mask_i, exponent, -jnp.inf), axis=-1, keepdims=True)  # (batch, n_queries, 1)
 	exponent_max = jax.lax.stop_gradient(jnp.where(jnp.isfinite(exponent_max), exponent_max, 0.0))
 	weight = jnp.exp(exponent - exponent_max)  # (batch, n_queries, max_points)
@@ -1275,6 +1304,7 @@ ARCH_DEFAULTS = dict(
 	n_self=2,  # perceiver: latent self-attention blocks after each cross-attention
 	wls=False,  # coefficients = weighted least-squares jet fit (learned weights) + bounded residual (weighted_jet_fit)
 	wls_bound=1.0,  # --wls: bound of the residual (units of the neighbourhood's median distance)
+	aux_heads=False,  # two more outputs per point: normal-flip logit and log-confidence of its torus (aux_blend_terms)
 )
 
 
@@ -1351,6 +1381,17 @@ class FundamentalFormPredictor(nnx.Module):
 				# per-token features for the weights: the neighbour tokens attend to the final latents
 				self.token_decoder = CrossAttentionBlock(embed_dim, n_heads, mlp_dim, rngs=rngs)
 
+		if self.arch['aux_heads']:
+			# --aux-heads: (flip logit, confidence logit) of the point; initially +1 (no flip, tanh' = 0.42) and 0 (all
+			# confidences equal, which leaves the normalized blend unchanged)
+			self.aux_head = nnx.Linear(
+				embed_dim,
+				2,
+				kernel_init=nnx.initializers.zeros_init(),
+				bias_init=nnx.initializers.constant(jnp.array([1.0, 0.0])),
+				rngs=rngs,
+			)
+
 		# Projection
 		# (a00, a01, a10, a11, a02, a20)
 		self.mlp = nnx.Sequential(
@@ -1413,8 +1454,8 @@ class FundamentalFormPredictor(nnx.Module):
 		return coeffs
 
 	def _forward_in_frame(self, positions, normals, s_hat, t_hat):
-		"""The network on neighborhoods expressed in the tangent frame (s_hat, t_hat) ([batch, 1, 3] each) -> the six
-		coefficients in that frame, scaled back to world units."""
+		"""The network on neighborhoods expressed in the tangent frame (s_hat, t_hat) ([batch, 1, 3] each) -> (the six
+		coefficients in that frame, scaled back to world units; the aux logits [batch, 2] or None)."""
 		x, scale, geometry = self.input_encoder(positions, normals, basis=(s_hat, t_hat), return_geometry=True)
 		if self.arch['encoder'] == 'perceiver':
 			tokens = x + self.token_mlp(x)
@@ -1433,15 +1474,18 @@ class FundamentalFormPredictor(nnx.Module):
 			per_token = self.final_norm(x)
 			x = per_token[:, 0, :]
 		c = self.mlp(x)
+		aux = self.aux_head(x) if self.arch['aux_heads'] else None
 		if self.arch['wls']:
 			w = jax.nn.softplus(self.wls_weights(per_token))  # [batch, k, 2]
 			c = weighted_jet_fit(geometry, w[..., 0], w[..., 1]) + self.arch['wls_bound'] * jnp.tanh(c)
-		return jnp.stack([c[:, 0] * scale, c[:, 1], c[:, 2], c[:, 3] / scale, c[:, 4] / scale, c[:, 5] / scale], axis=-1)
+		c = jnp.stack([c[:, 0] * scale, c[:, 1], c[:, 2], c[:, 3] / scale, c[:, 4] / scale, c[:, 5] / scale], axis=-1)
+		return c, aux
 
 	@nnx.jit
 	def predict(self, positions: jax.Array, normals: jax.Array):
 		"""
-		The network with its architecture options (self.arch) -> (coefficients [batch, 6] in the legacy frame, None).
+		The network with its architecture options (self.arch) -> (coefficients [batch, 6] in the legacy frame, aux):
+		aux is None, or with aux_heads the [batch, 2] logits (flip, confidence) of aux_blend_terms.
 		"""
 		n0 = normals[:, 0:1, :]
 		n0 = n0 / jnp.maximum(jnp.linalg.norm(n0, axis=-1, keepdims=True), NAN_EPSILON)
@@ -1454,18 +1498,22 @@ class FundamentalFormPredictor(nnx.Module):
 			s_rep, t_rep = jnp.tile(s_leg, (n_frames, 1, 1)), jnp.tile(t_leg, (n_frames, 1, 1))
 			s_hat = co[:, None, None] * s_rep + si[:, None, None] * t_rep
 			t_hat = -si[:, None, None] * s_rep + co[:, None, None] * t_rep
-			c = self._forward_in_frame(jnp.tile(positions, (n_frames, 1, 1)), jnp.tile(normals, (n_frames, 1, 1)), s_hat, t_hat)
+			c, aux = self._forward_in_frame(
+				jnp.tile(positions, (n_frames, 1, 1)), jnp.tile(normals, (n_frames, 1, 1)), s_hat, t_hat
+			)
 			c = rotate_coeffs(c, co, si).reshape(n_frames, batch, 6)
-			return jnp.einsum('fb,fbc->bc', weights.T, c), None
+			if aux is not None:
+				aux = jnp.einsum('fb,fbc->bc', weights.T, aux.reshape(n_frames, batch, -1))
+			return jnp.einsum('fb,fbc->bc', weights.T, c), aux
 		if self.arch['frame'] == 'continuous':
 			s_hat, t_hat = continuous_frame(n0)
 		else:
 			s_hat, t_hat = s_leg, t_leg
-		c = self._forward_in_frame(positions, normals, s_hat, t_hat)
+		c, aux = self._forward_in_frame(positions, normals, s_hat, t_hat)
 		# the frame (s_hat, t_hat) is the legacy one rotated by phi: s_hat = cos phi s_leg + sin phi t_leg
 		cos_phi = jnp.sum(s_hat * s_leg, axis=-1)[:, 0]
 		sin_phi = jnp.sum(s_hat * t_leg, axis=-1)[:, 0]
-		return rotate_coeffs(c, cos_phi, sin_phi), None
+		return rotate_coeffs(c, cos_phi, sin_phi), aux
 
 	def precompute_coefficients(self, points, normals, k_neighbors, outliers=np.array([])):
 		nnx.eval_mode(self)
@@ -1477,9 +1525,12 @@ class FundamentalFormPredictor(nnx.Module):
 
 		return predicted_coefficients
 
-	def precompute_coefficients_in_chunks(self, points, normals, k_neighbors, chunk_size=50000, outliers=np.array([])):
+	def precompute_coefficients_in_chunks(
+		self, points, normals, k_neighbors, chunk_size=50000, outliers=np.array([]), return_aux=False
+	):
 		"""
 		Process in chunks to avoid GPU memory issues
+		return_aux: also return the (|P|, 2) aux logits (aux_heads models; None otherwise)
 		"""
 		nnx.eval_mode(self)
 
@@ -1494,6 +1545,7 @@ class FundamentalFormPredictor(nnx.Module):
 
 		# Allocate output array
 		all_coefficients = []
+		all_aux = []
 
 		# Process in chunks
 		n_chunks = (n_points + chunk_size - 1) // chunk_size
@@ -1509,7 +1561,11 @@ class FundamentalFormPredictor(nnx.Module):
 			chunk_normals = normals[chunk_indices]  # (chunk_size, k, 3)
 
 			# Forward pass for this chunk
-			chunk_coeffs = self(chunk_points, chunk_normals)
+			if return_aux and self.arch['aux_heads']:
+				chunk_coeffs, chunk_aux = self.predict(chunk_points, chunk_normals)
+				all_aux.append(np.array(chunk_aux))
+			else:
+				chunk_coeffs = self(chunk_points, chunk_normals)
 
 			# Wait for GPU to finish and transfer to CPU
 			chunk_coeffs_cpu = np.array(chunk_coeffs.block_until_ready())
@@ -1527,6 +1583,8 @@ class FundamentalFormPredictor(nnx.Module):
 		# Concatenate all chunks
 		predicted_coefficients = np.concatenate(all_coefficients, axis=0)
 
+		if return_aux:
+			return predicted_coefficients, (np.concatenate(all_aux, axis=0) if all_aux else None)
 		return predicted_coefficients
 
 	@staticmethod

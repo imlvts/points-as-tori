@@ -1338,6 +1338,13 @@ class TorusDistanceField:
 	def set_outliers(self, indices):
 		self.bound_object.set_outliers(indices)
 
+	def has_point_weights(self):
+		"""Whether the compiled bindings support set_point_weights (added with --aux-heads)."""
+		return hasattr(self.bound_object, 'set_point_weights')
+
+	def set_point_weights(self, weights):
+		self.bound_object.set_point_weights(np.asarray(weights, dtype=np.float64))
+
 
 # ========================================================================
 # BVH

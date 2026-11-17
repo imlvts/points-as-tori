@@ -55,13 +55,33 @@ class PointsAsTori:
 
 			model, k_nb = PointsAsTori._load_model(model_path)
 
-			coeffs = model.precompute_coefficients_in_chunks(points, normals, k_nb, chunk_size=50000)
+			coeffs, aux = model.precompute_coefficients_in_chunks(points, normals, k_nb, chunk_size=50000, return_aux=True)
 			centers, axes, major_radii, minor_radii = fit_tori_from_forms(points, normals, np.array(coeffs))
+			if aux is not None:
+				minor_radii = self._apply_aux_heads(aux, np.array(minor_radii))
 
 			self._tdf.set_tori(centers, axes, major_radii, minor_radii)
 
 		else:
 			self._tdf.set_tori(tori['centers'], tori['axes'], tori['major_radii'], tori['minor_radii'])
+
+	def _apply_aux_heads(self, aux: np.ndarray, minor_radii: np.ndarray) -> np.ndarray:
+		"""
+		The extra outputs of a model trained with --aux-heads, as in training (network.aux_blend_terms):
+		flip logit < 0: the point's normal is taken as flipped, i.e. its torus' SDF is negated (the C++ fields encode the
+		sign in the minor radius); confidence alpha = sigmoid(logit) multiplies the point's blend weight (C++
+		set_point_weights; bindings without it fall back to marking points with alpha < 0.05 max alpha as outliers).
+		Tori saved with save_tori keep the flips but not the confidences.
+		"""
+		flip = aux[:, 0] < 0
+		alpha = 1.0 / (1.0 + np.exp(-aux[:, 1].astype(np.float64)))
+		if self._tdf.has_point_weights():
+			self._tdf.set_point_weights(alpha)
+		else:
+			print('Warning: the pat_bindings in use have no set_point_weights; thresholding the confidences instead')
+			self._tdf.set_outliers(np.nonzero(alpha < 0.05 * alpha.max())[0].astype(np.int32))
+		print(f'aux heads: {int(flip.sum())} flipped normals, confidence min {alpha.min():.3g} median {np.median(alpha):.3g}')
+		return np.where(flip, -minor_radii, minor_radii)
 
 	def signed_distance(self, queries: np.ndarray, accelerate: bool = True) -> np.ndarray:
 		"""
