@@ -108,10 +108,10 @@ def SDF_loss(
 		eikonal_weight: weight of the eikonality term (the distance term has weight 1)
 	"""
 
-	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
+	origins, frames, kappas = torus_frames_masked(mask, positions, normals, coefficients)
 
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
+		mask, queries, positions, origins, frames, kappas, knn=knn_blend
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -162,10 +162,10 @@ def validation_loss(
 	true_distances,
 	knn_blend=0,
 ):
-	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
+	origins, frames, kappas = torus_frames_masked(mask, positions, normals, coefficients)
 
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
+		mask, queries, positions, origins, frames, kappas, knn=knn_blend
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]

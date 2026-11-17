@@ -41,7 +41,7 @@ import jax.numpy as jnp
 from flax import nnx
 from scipy.spatial import cKDTree
 
-from pointsastori.network import FundamentalFormPredictor, torus_precompute_masked, torus_distance_gradient_masked
+from pointsastori.network import FundamentalFormPredictor, torus_frames_masked, torus_distance_gradient_masked
 import mesh_sampling_jax as MS
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -102,7 +102,7 @@ def field(P, N, C, knn=0):
 	"""Blended SDF (value, gradient) of the tori of cloud P, N with coefficients C."""
 	mask = jnp.ones(len(P), bool)
 	Pj = jnp.asarray(P, jnp.float32)
-	cen, ax, R, r = torus_precompute_masked(mask, Pj, jnp.asarray(N, jnp.float32), jnp.asarray(C, jnp.float32))
+	tori = torus_frames_masked(mask, Pj, jnp.asarray(N, jnp.float32), jnp.asarray(C, jnp.float32))
 
 	def f(Q, chunk=512):
 		ds, gs = [], []
@@ -110,7 +110,7 @@ def field(P, N, C, knn=0):
 			q = np.zeros((chunk, 3), np.float32)
 			m = min(chunk, len(Q) - s)
 			q[:m] = Q[s : s + m]
-			d, g = torus_distance_gradient_masked(mask, jnp.asarray(q)[None], Pj, cen, ax, R, r, knn=knn)
+			d, g = torus_distance_gradient_masked(mask, jnp.asarray(q)[None], Pj, *tori, knn=knn)
 			ds.append(np.asarray(d[0])[:m])
 			gs.append(np.asarray(g[0])[:m])
 		return np.concatenate(ds).astype(np.float64), np.concatenate(gs).astype(np.float64)
@@ -419,9 +419,9 @@ def loss_eval(model, k, validation_file):
 			)
 			C = coeffs(model, P, N, nb)
 			mj = jnp.asarray(m)
-			cen, ax, R, r = torus_precompute_masked(mj, jnp.asarray(P), jnp.asarray(N), jnp.asarray(C))
+			tori = torus_frames_masked(mj, jnp.asarray(P), jnp.asarray(N), jnp.asarray(C))
 			for s in range(0, len(rows), 128):
-				d, g = torus_distance_gradient_masked(mj, q[s : s + 128], jnp.asarray(P), cen, ax, R, r, knn=knn)
+				d, g = torus_distance_gradient_masked(mj, q[s : s + 128], jnp.asarray(P), *tori, knn=knn)
 				l1.append(np.abs(np.asarray(d) - np.asarray(D[s : s + 128])).ravel())
 				eik.append(np.abs(1 - np.linalg.norm(np.asarray(g), axis=-1)).ravel())
 		tag = 'all' if knn == 0 else f'knn{knn}'

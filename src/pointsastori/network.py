@@ -186,6 +186,117 @@ def compute_lambdas_jax(shifts: jnp.ndarray) -> jnp.ndarray:
 	return 64.0 / shifts
 
 
+def _masked_fit_inputs(mask, points, normals, coeffs):
+	"""The inputs of the torus fits with the masked rows replaced by a dummy."""
+	# Masked (padded) rows get a fixed, well-conditioned dummy input (unit normal, the network's initial sphere
+	# coefficients) before the fit. The where passes no cotangent to the masked rows, so a degenerate fit there (zero
+	# normals, arbitrary coefficients) can neither produce NaN values nor NaN gradients; the blend drops these tori
+	# through its mask as before.
+	row_mask = mask[:, None]
+	points = jnp.where(row_mask, points, 0.0)
+	normals = jnp.where(row_mask, normals, jnp.array([0.0, 0.0, 1.0], dtype=normals.dtype))
+	coeffs = jnp.where(row_mask, coeffs, jnp.array([0.0, 0.0, 0.0, 0.0, -0.5, -0.5], dtype=coeffs.dtype))
+	return points, normals, coeffs
+
+
+def _principal_fit(p_i, n_i, c_i):
+	"""The quadric fit at one point: (a00, kappa_min, kappa_max, v_min, normal) with |kappa_min| <= |kappa_max|, v_min
+	the (unnormalized) principal direction of kappa_min and normal = n*(0,0), the unit normal at the contact point
+	p* = p_i + a00 n_i (for unit n_i)."""
+	# Compute orthonormal bases
+	s_hat, t_hat = orthonormal_basis_with_rotation(n_i, 0.0)
+
+	# Extract polynomial coefficients
+	a00 = c_i[0]
+	a01 = c_i[1]
+	a10 = c_i[2]
+	a11 = c_i[3]
+	a02 = c_i[4]
+	a20 = c_i[5]
+
+	# Compute principal curvatures from polynomial fit
+	A = jnp.sqrt(1.0 + a01**2 + a10**2)
+	# A = jnp.maximum(A, NAN_EPSILON)
+
+	# Compute discriminant for eigenvector calculation
+	v1 = a20 * a01**2 - a02 * a10**2 - a02 + a20
+	v2 = a11 * (a10**2 + 1.0) - 2.0 * a01 * a10 * a20
+	term = a02 * (a10**2 + 1.0) - a01 * a10 * a11 + a20 * (a01**2 + 1.0)
+	discriminant = (1.0 + a01**2 + a10**2) * (a11**2 - 4.0 * a02 * a20) + term**2
+	discriminant = jnp.sqrt(jnp.maximum(discriminant, NAN_EPSILON))  # sqrt not differentiable at 0
+
+	ev_pos_0 = v1 + discriminant
+	ev_pos_0 = sign_floor(ev_pos_0)
+	ev_pos = jnp.array([ev_pos_0, v2])
+
+	ev_neg_1 = v2
+	ev_neg_1 = sign_floor(ev_neg_1)
+	ev_neg = jnp.array([v1 - discriminant, ev_neg_1])
+
+	# Even though normalization isn't necessary because we take a Rayleigh quotient, it helps numerically.
+	ev_pos /= jnp.linalg.norm(ev_pos)
+	ev_neg /= jnp.linalg.norm(ev_neg)
+	ev_pos_x = ev_pos[0]
+	ev_pos_y = ev_pos[1]
+	ev_neg_x = ev_neg[0]
+	ev_neg_y = ev_neg[1]
+
+	# Convert to 3D eigenvectors
+	dQstards = s_hat + a10 * n_i  # (3, )
+	dQstardt = t_hat + a01 * n_i  # (3, )
+
+	v_pos = ev_pos_x * dQstards + ev_pos_y * dQstardt
+	v_neg = ev_neg_x * dQstards + ev_neg_y * dQstardt
+
+	# Compute normal at fitted point
+	normal = (n_i - a10 * s_hat - a01 * t_hat) / A
+
+	# Compute curvatures using Rayleigh quotient
+	I_11 = 1.0 + a10**2
+	I_12 = a10 * a01
+	I_22 = 1.0 + a01**2
+
+	II_11 = 2.0 * a20 / A
+	II_12 = a11 / A
+	II_22 = 2.0 * a02 / A
+
+	# Compute kappa = (ev^T @ II @ ev) / (ev^T @ I @ ev)
+	# For positive eigenvector
+	II_ev_pos_x = II_11 * ev_pos_x + II_12 * ev_pos_y
+	II_ev_pos_y = II_12 * ev_pos_x + II_22 * ev_pos_y
+	I_ev_pos_x = I_11 * ev_pos_x + I_12 * ev_pos_y
+	I_ev_pos_y = I_12 * ev_pos_x + I_22 * ev_pos_y
+
+	numer_pos = ev_pos_x * II_ev_pos_x + ev_pos_y * II_ev_pos_y
+	denom_pos = ev_pos_x * I_ev_pos_x + ev_pos_y * I_ev_pos_y
+	denom_pos = sign_floor(denom_pos)
+	kappa_pos = numer_pos / denom_pos
+	# kappa_pos = jax.lax.cond(numer_pos == 0, lambda: NAN_EPSILON, lambda: numer_pos / denom_pos)
+
+	# For negative eigenvector
+	II_ev_neg_x = II_11 * ev_neg_x + II_12 * ev_neg_y
+	II_ev_neg_y = II_12 * ev_neg_x + II_22 * ev_neg_y
+	I_ev_neg_x = I_11 * ev_neg_x + I_12 * ev_neg_y
+	I_ev_neg_y = I_12 * ev_neg_x + I_22 * ev_neg_y
+
+	numer_neg = ev_neg_x * II_ev_neg_x + ev_neg_y * II_ev_neg_y
+	denom_neg = ev_neg_x * I_ev_neg_x + ev_neg_y * I_ev_neg_y
+	denom_neg = sign_floor(denom_neg)
+	kappa_neg = numer_neg / denom_neg
+	# kappa_neg = jax.lax.cond(numer_neg == 0, lambda: NAN_EPSILON, lambda: numer_neg / denom_neg)
+
+	# Identify min/max curvatures
+	abs_kappa_pos = jnp.abs(kappa_pos)
+	abs_kappa_neg = jnp.abs(kappa_neg)
+
+	use_pos_as_min = abs_kappa_pos < abs_kappa_neg
+	kappa_min = jnp.where(use_pos_as_min, kappa_pos, kappa_neg)
+	kappa_max = jnp.where(use_pos_as_min, kappa_neg, kappa_pos)
+	v_min = jnp.where(use_pos_as_min, v_pos, v_neg)
+
+	return a00, kappa_min, kappa_max, v_min, normal
+
+
 @jit
 def torus_precompute_masked(
 	mask: jnp.ndarray,
@@ -211,112 +322,14 @@ def torus_precompute_masked(
 
 	max_points = points.shape[0]
 
-	# Masked (padded) rows get a fixed, well-conditioned dummy input (unit normal, the network's initial sphere
-	# coefficients) before the fit. The where passes no cotangent to the masked rows, so a degenerate fit there (zero
-	# normals, arbitrary coefficients) can neither produce NaN values nor NaN gradients; the blend drops these tori
-	# through its mask as before.
-	row_mask = mask[:, None]
-	points = jnp.where(row_mask, points, 0.0)
-	normals = jnp.where(row_mask, normals, jnp.array([0.0, 0.0, 1.0], dtype=normals.dtype))
-	coeffs = jnp.where(row_mask, coeffs, jnp.array([0.0, 0.0, 0.0, 0.0, -0.5, -0.5], dtype=coeffs.dtype))
+	points, normals, coeffs = _masked_fit_inputs(mask, points, normals, coeffs)
 
 	# Fit torus at a single point.
 	@jit
 	def solve_single(i):
-		# Center point info
 		p_i = points[i]
 		n_i = normals[i]
-
-		# Compute orthonormal bases
-		s_hat, t_hat = orthonormal_basis_with_rotation(n_i, 0.0)
-
-		# Extract polynomial coefficients
-		a00 = coeffs[i, 0]
-		a01 = coeffs[i, 1]
-		a10 = coeffs[i, 2]
-		a11 = coeffs[i, 3]
-		a02 = coeffs[i, 4]
-		a20 = coeffs[i, 5]
-
-		# Compute principal curvatures from polynomial fit
-		A = jnp.sqrt(1.0 + a01**2 + a10**2)
-		# A = jnp.maximum(A, NAN_EPSILON)
-
-		# Compute discriminant for eigenvector calculation
-		v1 = a20 * a01**2 - a02 * a10**2 - a02 + a20
-		v2 = a11 * (a10**2 + 1.0) - 2.0 * a01 * a10 * a20
-		term = a02 * (a10**2 + 1.0) - a01 * a10 * a11 + a20 * (a01**2 + 1.0)
-		discriminant = (1.0 + a01**2 + a10**2) * (a11**2 - 4.0 * a02 * a20) + term**2
-		discriminant = jnp.sqrt(jnp.maximum(discriminant, NAN_EPSILON))  # sqrt not differentiable at 0
-
-		ev_pos_0 = v1 + discriminant
-		ev_pos_0 = sign_floor(ev_pos_0)
-		ev_pos = jnp.array([ev_pos_0, v2])
-
-		ev_neg_1 = v2
-		ev_neg_1 = sign_floor(ev_neg_1)
-		ev_neg = jnp.array([v1 - discriminant, ev_neg_1])
-
-		# Even though normalization isn't necessary because we take a Rayleigh quotient, it helps numerically.
-		ev_pos /= jnp.linalg.norm(ev_pos)
-		ev_neg /= jnp.linalg.norm(ev_neg)
-		ev_pos_x = ev_pos[0]
-		ev_pos_y = ev_pos[1]
-		ev_neg_x = ev_neg[0]
-		ev_neg_y = ev_neg[1]
-
-		# Convert to 3D eigenvectors
-		dQstards = s_hat + a10 * n_i  # (3, )
-		dQstardt = t_hat + a01 * n_i  # (3, )
-
-		v_pos = ev_pos_x * dQstards + ev_pos_y * dQstardt
-		v_neg = ev_neg_x * dQstards + ev_neg_y * dQstardt
-
-		# Compute normal at fitted point
-		normal = (n_i - a10 * s_hat - a01 * t_hat) / A
-
-		# Compute curvatures using Rayleigh quotient
-		I_11 = 1.0 + a10**2
-		I_12 = a10 * a01
-		I_22 = 1.0 + a01**2
-
-		II_11 = 2.0 * a20 / A
-		II_12 = a11 / A
-		II_22 = 2.0 * a02 / A
-
-		# Compute kappa = (ev^T @ II @ ev) / (ev^T @ I @ ev)
-		# For positive eigenvector
-		II_ev_pos_x = II_11 * ev_pos_x + II_12 * ev_pos_y
-		II_ev_pos_y = II_12 * ev_pos_x + II_22 * ev_pos_y
-		I_ev_pos_x = I_11 * ev_pos_x + I_12 * ev_pos_y
-		I_ev_pos_y = I_12 * ev_pos_x + I_22 * ev_pos_y
-
-		numer_pos = ev_pos_x * II_ev_pos_x + ev_pos_y * II_ev_pos_y
-		denom_pos = ev_pos_x * I_ev_pos_x + ev_pos_y * I_ev_pos_y
-		denom_pos = sign_floor(denom_pos)
-		kappa_pos = numer_pos / denom_pos
-		# kappa_pos = jax.lax.cond(numer_pos == 0, lambda: NAN_EPSILON, lambda: numer_pos / denom_pos)
-
-		# For negative eigenvector
-		II_ev_neg_x = II_11 * ev_neg_x + II_12 * ev_neg_y
-		II_ev_neg_y = II_12 * ev_neg_x + II_22 * ev_neg_y
-		I_ev_neg_x = I_11 * ev_neg_x + I_12 * ev_neg_y
-		I_ev_neg_y = I_12 * ev_neg_x + I_22 * ev_neg_y
-
-		numer_neg = ev_neg_x * II_ev_neg_x + ev_neg_y * II_ev_neg_y
-		denom_neg = ev_neg_x * I_ev_neg_x + ev_neg_y * I_ev_neg_y
-		denom_neg = sign_floor(denom_neg)
-		kappa_neg = numer_neg / denom_neg
-		# kappa_neg = jax.lax.cond(numer_neg == 0, lambda: NAN_EPSILON, lambda: numer_neg / denom_neg)
-
-		# Identify min/max curvatures
-		abs_kappa_pos = jnp.abs(kappa_pos)
-		abs_kappa_neg = jnp.abs(kappa_neg)
-
-		use_pos_as_min = abs_kappa_pos < abs_kappa_neg
-		kappa_min = jnp.where(use_pos_as_min, kappa_pos, kappa_neg)
-		kappa_max = jnp.where(use_pos_as_min, kappa_neg, kappa_pos)
-		v_min = jnp.where(use_pos_as_min, v_pos, v_neg)
+		a00, kappa_min, kappa_max, v_min, normal = _principal_fit(p_i, n_i, coeffs[i])
 
 		# Geometric sign rule (the osculating torus at every point, saddles included). With the curvatures floored to
 		# +-NAN_EPSILON keeping their sign (+NAN_EPSILON at exactly 0) and the signed radii of curvature
@@ -360,6 +373,77 @@ def torus_precompute_masked(
 
 
 @jit
+def torus_frames_masked(
+	mask: jnp.ndarray,
+	points: jnp.ndarray,
+	normals: jnp.ndarray,
+	coeffs: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+	"""
+	The tori of torus_precompute_masked in the frame form used by the training blend (torus_distance_gradient_masked):
+	the contact point p*, the orthonormal frame (e_x, e_y, e_z) = (v_min / |v_min|, u, n*) with u = n* x v_min / |.| the
+	torus axis, and the signed principal curvatures (kappa_min, kappa_max) (not floored). The torus is the same as
+	that of (center, axis, R, r) = torus_precompute_masked(...) (geometric sign rule): center p* + n* / kappa_min, axis
+	u, R = |1/kappa_min - 1/kappa_max|, r = -1/kappa_max; torus_signed_distance_frame evaluates it without the radii.
+
+	Returns:
+		origins: (max_points, 3) contact points p*
+		frames: (max_points, 3, 3) rows e_x, e_y (= axis), e_z (= n*)
+		kappas: (max_points, 2) (kappa_min, kappa_max)
+	"""
+	max_points = points.shape[0]
+	points, normals, coeffs = _masked_fit_inputs(mask, points, normals, coeffs)
+
+	@jit
+	def solve_single(i):
+		p_i = points[i]
+		n_i = normals[i]
+		a00, kappa_min, kappa_max, v_min, normal = _principal_fit(p_i, n_i, coeffs[i])
+		u = jnp.cross(normal, v_min)
+		u = u / jnp.maximum(jnp.linalg.norm(u), NAN_EPSILON)
+		e_x = jnp.cross(u, normal)  # = v_min / |v_min| (v_min is tangent: v_min . n* = 0)
+		return p_i + a00 * n_i, jnp.stack([e_x, u, normal]), jnp.stack([kappa_min, kappa_max])
+
+	return jax.vmap(solve_single)(jnp.arange(max_points))
+
+
+def torus_signed_distance_frame(rel, frame, kappas):
+	"""
+	Signed distance and its spatial gradient of tori in frame form at the offsets rel = q - p* (broadcasting over the
+	leading axes; rel (..., 3), frame (..., 3, 3), kappas (..., 2)).
+
+	With (x, y, z) the frame coordinates of q - p* and k1 = kappa_min, k2 = kappa_max, the explicit torus SDF
+	(center p* + n*/k1, axis e_y, R = |1/k1 - 1/k2|, signed minor radius -1/k2) is, after rationalizing both
+	sqrt(.) - 1 steps (exact for every sign of k1, k2, and on both sides of the focal points):
+		S1 = sqrt((1 - k1 z)^2 + (k1 x)^2),  zeta = (2 z - k1 (x^2 + z^2)) / (S1 + 1)  (the height over the parallel circle),
+		S2 = sqrt((1 - k2 zeta)^2 + (k2 y)^2),  g = (2 zeta - k2 (zeta^2 + y^2)) / (S2 + 1),
+		grad g = ((1 - k2 zeta) / S2) ((-k1 x) e_x + (1 - k1 z) e_z) / S1 + (-k2 y / S2) e_y.
+	There is no 1/kappa: no float32 cancellation of radii ~ 1/kappa against offsets ~ sigma for nearly flat tori
+	(g = z at k1 = k2 = 0), and no 1/kappa^2 in the derivatives. S1 = 0 (q on the torus axis) and S2 = 0 (q on the
+	tube circle) are the torus' own non-smooth points; there the squares are floored to NAN_EPSILON^2 (a value change
+	below float32 resolution elsewhere) so that the derivatives stay finite, as v_safe, d_safe did.
+	"""
+	x = jnp.sum(rel * frame[..., 0, :], axis=-1)
+	y = jnp.sum(rel * frame[..., 1, :], axis=-1)
+	z = jnp.sum(rel * frame[..., 2, :], axis=-1)
+	k1 = kappas[..., 0]
+	k2 = kappas[..., 1]
+	a1 = 1.0 - k1 * z
+	b1 = k1 * x
+	S1 = jnp.sqrt(jnp.maximum(a1 * a1 + b1 * b1, NAN_EPSILON**2))
+	zeta = (2.0 * z - k1 * (x * x + z * z)) / (S1 + 1.0)
+	a2 = 1.0 - k2 * zeta
+	b2 = k2 * y
+	S2 = jnp.sqrt(jnp.maximum(a2 * a2 + b2 * b2, NAN_EPSILON**2))
+	g = (2.0 * zeta - k2 * (zeta * zeta + y * y)) / (S2 + 1.0)
+	cx = (a2 / S2) * (-b1 / S1)  # d g / d x
+	cy = -b2 / S2  # d g / d y
+	cz = (a2 / S2) * (a1 / S1)  # d g / d z
+	grad = cx[..., None] * frame[..., 0, :] + cy[..., None] * frame[..., 1, :] + cz[..., None] * frame[..., 2, :]
+	return g, grad
+
+
+@jit
 def torus_signed_distance(q, center, axis, major_radius, minor_radius):
 	"""
 	Compute the signed distance at q to a single (signed) torus.
@@ -391,10 +475,9 @@ def torus_distance_gradient_masked(
 	mask: jnp.ndarray,
 	queries: jnp.ndarray,
 	points: jnp.ndarray,
-	centers: jnp.ndarray,
-	axes: jnp.ndarray,
-	major_radii: jnp.ndarray,
-	minor_radii: jnp.ndarray,
+	origins: jnp.ndarray,
+	frames: jnp.ndarray,
+	kappas: jnp.ndarray,
 	knn: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 	"""
@@ -409,10 +492,10 @@ def torus_distance_gradient_masked(
 		mask: (max_points,) - boolean mask indicating valid points
 		queries: (batch_size, n_queries, 3) array of query points
 		points: (max_points, 3) - may contain padding
-		centers: (max_points, 3) - torii centers
-		axes: (max_points, 2) - torii axes
-		major_radii: (max_points,)
-		minor_radii: (max_points,)
+		origins, frames, kappas: the tori in frame form (torus_frames_masked); the per-torus distance is
+			torus_signed_distance_frame, the same function as the explicit (center, axis, R, r) torus SDF up to
+			rounding, without the float32 cancellation of nearly flat tori and without the (theta, phi) round trip of
+			the axis
 
 	Returns:
 		distances: (batch_size, n_queries,) array of signed distances
@@ -420,17 +503,13 @@ def torus_distance_gradient_masked(
 	"""
 	batch_size, n_queries, _ = queries.shape
 
-	# Create validity mask for torii without NaNs --- in case there were still NaNs that escaped torus_precompute_masked()
+	# Create validity mask for torii without NaNs --- in case there were still NaNs that escaped torus_frames_masked()
 	valid_torus_mask = (
 		mask
-		& jnp.isfinite(centers).all(axis=-1)
-		& jnp.isfinite(axes).all(axis=-1)
-		& jnp.isfinite(major_radii)
-		& jnp.isfinite(minor_radii)
+		& jnp.isfinite(origins).all(axis=-1)
+		& jnp.isfinite(frames).all(axis=(-2, -1))
+		& jnp.isfinite(kappas).all(axis=-1)
 	)  # (max_points,)
-	# valid_torus_mask = mask  # (max_points, )
-
-	axis3d = rotation_to_cartesian_jax(axes)  # (max_points, 3)
 
 	# Compute distance and gradient for each query-torus pair
 
@@ -448,10 +527,9 @@ def torus_distance_gradient_masked(
 		dist_to_point = jnp.linalg.norm(rVec, axis=-1)  # (batch, n_queries, knn)
 		mask_i = valid_torus_mask[nearest]
 		shifts = 0.5 * jnp.max(jnp.where(mask_i, dist_to_point, 0.0), axis=-1)  # (batch, n_queries)
-		c_i = centers[nearest]
-		axis_i = axis3d[nearest]
-		R_i = major_radii[nearest]
-		r_i = minor_radii[nearest]
+		o_i = origins[nearest]
+		f_i = frames[nearest]
+		k_i = kappas[nearest]
 	else:
 		# Broadcast points, centers, etc. for all queries
 		# (1, 1, max_points, 3)
@@ -463,73 +541,16 @@ def torus_distance_gradient_masked(
 		dist_to_point = jnp.linalg.norm(rVec, axis=-1)  # (batch, n_queries, max_points)
 
 		shifts = _compute_shifts_from_distances(dist_to_point, valid_torus_mask)  # (batch, n_queries)
-		c_i = centers[None, None, :, :]
-		axis_i = axis3d[None, None, :, :]
-		R_i = major_radii[None, None, :]
-		r_i = minor_radii[None, None, :]
+		o_i = origins[None, None, :, :]
+		f_i = frames[None, None, :, :, :]
+		k_i = kappas[None, None, :, :]
 		mask_i = valid_torus_mask[None, None, :]  # (1, 1, max_points)
 	lam = compute_lambdas_jax(shifts)  # (batch_size, n_queries)
 
-	# Distance from query to torus center
-	r_vec = q - c_i  # (batch, n_queries, max_points, 3)
-
-	# v = |r_vec × axis|
-	cross_prod = jnp.cross(r_vec, axis_i)  # (batch, n_queries, max_points, 3)
-	v = jnp.linalg.norm(cross_prod, axis=-1)  # (batch, n_queries, max_points)
-
-	# Distance components
-	d1 = v - R_i  # (batch, n_queries, max_points)
-	d2 = jnp.sum(r_vec * axis_i, axis=-1)  # (batch, n_queries, max_points)
-
-	# Combined distance to torus surface
-	d = jnp.sqrt(d1**2 + d2**2)  # (batch, n_queries, max_points)
-
-	s = jnp.sign(r_i)  # (1, 1, max_points)
-	g_z = s * (d - jnp.abs(r_i))  # (batch, n_queries, max_points)
+	# Signed distance and spatial gradient of every query-torus pair (the frame form of the torus SDF)
+	g_z, grad_g = torus_signed_distance_frame(q - o_i, f_i, k_i)  # (batch, n_queries, max_points[, 3])
 	g_z = jnp.where(mask_i, g_z, 0.0)  # apply mask
-
-	# Gradient computation (matrix G from C++ code)
-	# G is a 2x3 matrix, w is a 2-vector, grad = s * (w^T @ G)^T
-	v_safe = jnp.maximum(v, NAN_EPSILON)
-
-	G_11 = (
-		axis_i[:, :, :, 0] * axis_i[:, :, :, 1] * (c_i[:, :, :, 1] - q[:, :, :, 1])
-		+ axis_i[:, :, :, 0] * axis_i[:, :, :, 2] * (c_i[:, :, :, 2] - q[:, :, :, 2])
-		- (axis_i[:, :, :, 1] ** 2 + axis_i[:, :, :, 2] ** 2) * (c_i[:, :, :, 0] - q[:, :, :, 0])
-	) / v_safe
-
-	G_12 = (
-		axis_i[:, :, :, 0] * axis_i[:, :, :, 1] * (c_i[:, :, :, 0] - q[:, :, :, 0])
-		+ axis_i[:, :, :, 1] * axis_i[:, :, :, 2] * (c_i[:, :, :, 2] - q[:, :, :, 2])
-		- (axis_i[:, :, :, 0] ** 2 + axis_i[:, :, :, 2] ** 2) * (c_i[:, :, :, 1] - q[:, :, :, 1])
-	) / v_safe
-
-	G_13 = (
-		axis_i[:, :, :, 0] * axis_i[:, :, :, 2] * (c_i[:, :, :, 0] - q[:, :, :, 0])
-		+ axis_i[:, :, :, 1] * axis_i[:, :, :, 2] * (c_i[:, :, :, 1] - q[:, :, :, 1])
-		- (axis_i[:, :, :, 0] ** 2 + axis_i[:, :, :, 1] ** 2) * (c_i[:, :, :, 2] - q[:, :, :, 2])
-	) / v_safe
-
-	G_21 = axis_i[:, :, :, 0]
-	G_22 = axis_i[:, :, :, 1]
-	G_23 = axis_i[:, :, :, 2]
-
-	# Weight vector w = (d1, d2) / ||(d1, d2)||
-	d_safe = jnp.maximum(d, NAN_EPSILON)
-	w_x = d1 / d_safe
-	w_y = d2 / d_safe
-
-	# Gradient: grad = s * (w^T @ G)^T = s * G^T @ w
-	grad_x = s * (w_x * G_11 + w_y * G_21)
-	grad_y = s * (w_x * G_12 + w_y * G_22)
-	grad_z = s * (w_x * G_13 + w_y * G_23)
-
-	# Apply mask to gradients
-	grad_x = jnp.where(mask_i, grad_x, 0.0)
-	grad_y = jnp.where(mask_i, grad_y, 0.0)
-	grad_z = jnp.where(mask_i, grad_z, 0.0)
-
-	grad_g = jnp.stack([grad_x, grad_y, grad_z], axis=-1)  # (batch, n_queries, max_points, 3)
+	grad_g = jnp.where(mask_i[..., None], grad_g, 0.0)
 
 	# Compute exponential weights
 	rHat = rVec / jnp.maximum(dist_to_point, NAN_EPSILON)[:, :, :, None]
