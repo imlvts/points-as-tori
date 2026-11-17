@@ -404,6 +404,8 @@ def TrainFundamentalFormPredictor(
 	quantize=0.0,
 	mix='',
 	arch=None,
+	corrupt_flip=0.0,
+	corrupt_outliers=0.0,
 ):
 	"""
 	Args:
@@ -435,6 +437,9 @@ def TrainFundamentalFormPredictor(
 		mix: 'analytic:FRAC:PATH' with multishape: each patch slot is, with probability FRAC, a patch of an analytic scene
 			of PATH (gen_analytic.py) with exact-SDF queries (analytic_sdf.analytic_queries) instead of a data shape;
 			resample and rotate apply to the analytic scenes too ('': off)
+		corrupt_flip, corrupt_outliers: with multishape: per visit, negate each input normal with probability
+			corrupt_flip, and move each input point off the surface (1-5 sigma, random normal) with probability
+			corrupt_outliers (augment.corrupt; the ground truth stays the mesh; for --aux-heads; 0: off)
 		arch: architecture options of the network (network.ARCH_DEFAULTS; None or {}: the authors' network); saved with
 			the weights, and a warm start (load_model_path) must have the same
 	"""
@@ -554,6 +559,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
+	if (corrupt_flip or corrupt_outliers) and not multishape:
+		raise ValueError('corrupt_flip and corrupt_outliers need multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -737,6 +744,7 @@ def TrainFundamentalFormPredictor(
 				P, N, NB, M, V, F, FM, tree = augment.visit(
 					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize
 				)
+				P, N, NB, M, tree = augment.corrupt(P, N, NB, M, tree, k_neighbors, rng, corrupt_flip, corrupt_outliers)
 				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng)
 				patches.append(patch + (V, F, FM))
 			return patches
@@ -1437,8 +1445,23 @@ def parse_args(argv=None):
 		action='store_true',
 		help='architecture: two more outputs per point, a normal-flip logit (the torus SDF is negated where < 0; '
 		'straight-through sign in training) and a confidence logit (log sigmoid added to the point\'s blend exponent). '
-		'Only useful with corrupted inputs. Saved with the model; infer.py applies '
+		'Only useful with corrupted inputs (--corrupt-flip, --corrupt-outliers). Saved with the model; infer.py applies '
 		'both heads',
+	)
+	ap.add_argument(
+		'--corrupt-flip',
+		type=float,
+		default=0.0,
+		metavar='P',
+		help='with --multishape: negate each input normal with probability P per visit (isolated flips; for --aux-heads; 0: off)',
+	)
+	ap.add_argument(
+		'--corrupt-outliers',
+		type=float,
+		default=0.0,
+		metavar='P',
+		help='with --multishape: move each input point 1-5 sigma off the surface in a random direction, with a random '
+		'normal, with probability P per visit (for --aux-heads; 0: off)',
 	)
 	ap.add_argument(
 		'--knn-blend',
@@ -1488,6 +1511,8 @@ def main(argv=None):
 		quantize=a.quantize,
 		mix=a.mix,
 		arch=arch_options(a),
+		corrupt_flip=a.corrupt_flip,
+		corrupt_outliers=a.corrupt_outliers,
 	)
 
 
