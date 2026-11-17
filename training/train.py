@@ -118,11 +118,13 @@ def SDF_loss(
 	num_valid = jnp.sum(batch_mask)  # number of valid points in the neighborhood
 	distance_error = jnp.abs((predicted_distances - true_distances))  # (batch_size, n_queries, )
 	distance_valid_mask = ~jnp.isnan(distance_error) & batch_mask[:, None]
-	distance_error_masked = jnp.sum(distance_error * distance_valid_mask, axis=-1)  # (batch_size,)
+	distance_error_masked = jnp.sum(jnp.where(distance_valid_mask, distance_error, 0.0), axis=-1)  # (batch_size,)
 	num_valid_distance_queries = jnp.sum(distance_valid_mask)
 
+	# |grad phi| with the square floored to NAN_EPSILON^2: the same value (to float32 resolution) and a finite derivative
+	# where the blended gradient vanishes (sqrt'(0) = inf gave NaN, which zeroed the whole step's gradient)
 	eikonality_error = jnp.abs(
-		1.0 - jnp.sqrt(jnp.sum(predicted_gradients * predicted_gradients, axis=-1))
+		1.0 - jnp.sqrt(jnp.maximum(jnp.sum(predicted_gradients * predicted_gradients, axis=-1), NAN_EPSILON**2))
 	)  # (batch_size, n_queries,)
 	eikonality_valid_mask = ~jnp.isnan(eikonality_error) & batch_mask[:, None]  # (batch_size, n_queries)
 	eikonality_error_masked = jnp.sum(
@@ -172,7 +174,7 @@ def validation_loss(
 	num_valid = jnp.sum(batch_mask)  # number of valid points in the neighborhood
 	distance_error = jnp.abs((predicted_distances - true_distances))  # (batch_size, n_queries, )
 	distance_valid_mask = ~jnp.isnan(distance_error) & batch_mask[:, None]
-	distance_error_masked = jnp.sum(distance_error * distance_valid_mask, axis=-1)  # (batch_size,)
+	distance_error_masked = jnp.sum(jnp.where(distance_valid_mask, distance_error, 0.0), axis=-1)  # (batch_size,)
 	num_valid_distance_queries = jnp.sum(distance_valid_mask)
 
 	eikonality_error = jnp.abs(
