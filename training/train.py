@@ -1047,8 +1047,11 @@ def TrainFundamentalFormPredictor(
 		axes[1, 1].grid(True, alpha=0.3)
 
 	plt.tight_layout()
-	plt.savefig('PlotTrainingHistory.png', dpi=150)
-	print('Training history plot saved to PlotTrainingHistory.png')
+	# Next to the model (the working directory was shared by all phases and runs: each overwrote the last plot)
+	plot_path = os.path.join(models_dir, (final_save_filepath or f'FundamentalFormPredictor_{num_epochs - 1}') + '_history.png')
+	plt.savefig(plot_path, dpi=150)
+	plt.close(fig)
+	print(f'Training history plot saved to {plot_path}')
 
 
 def authors_curriculum(data_dir='datasets', models_dir=MODELS_DIR):
