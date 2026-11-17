@@ -1100,14 +1100,13 @@ class InputFeatures(nnx.Module):
 		# features. Even when such rows are masked out of the loss, NaN activations turn the (zero) cotangent of every
 		# shared weight into NaN, i.e. the whole gradient of the step. Use scale 1 there instead.
 		median = jnp.where(median > 0, median, 1.0)
-		normalized_positions = positions / median[:, None, None]  # [batch, k, 3]
 
 		# The following block of code is copied from local_coordinates() above, because we also need the orthonormal basis.
-		center_point = normalized_positions[:, 0:1, :]  # [batch, 1, 3]
 		s_hat, t_hat = orthonormal_basis_with_rotation(center_normal, 0.0)
 
-		# Encode relative positions in local frame as (s, t, Q(s, t)) tuples.
-		diff_vectors = normalized_positions - center_point  # [batch, k, 3]
+		# Encode relative positions in local frame as (s, t, Q(s, t)) tuples. The offsets (p_j - p_0) / median, the same
+		# as p_j / median - p_0 / median up to rounding, without the float32 cancellation of clouds far from the origin.
+		diff_vectors = diff_vectors / median[:, None, None]  # [batch, k, 3]
 		heights = jnp.sum(diff_vectors * center_normal, axis=-1, keepdims=True)  # [batch, k, 1]
 		S = jnp.sum(diff_vectors * s_hat, axis=-1, keepdims=True)  # [batch, k, 1]
 		T = jnp.sum(diff_vectors * t_hat, axis=-1, keepdims=True)  # [batch, k, 1]
