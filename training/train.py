@@ -196,7 +196,12 @@ def validation_loss(
 		lambda: 0.0,
 	)
 
-	return distance_loss, eikonality_loss
+	return distance_loss, eikonality_loss, num_valid_distance_queries, num_valid_eikonality_queries
+
+
+# Rows (query neighborhoods) per call of the validation's query generation and loss: the validation of a whole shape at
+# once (2048 points x 120 queries against all faces / all points) needed a 14.5 GiB temporary buffer on the GPU.
+VALIDATION_CHUNK = 128
 
 
 def FundamentalFormPredictorTrainer(
@@ -613,6 +618,7 @@ def TrainFundamentalFormPredictor(
 				val_fmask,
 				val_key,
 				n_queries=n_queries_per_neighborhood,
+				chunk=VALIDATION_CHUNK,
 			)
 
 			# Compute weights for this validation shape
@@ -631,18 +637,24 @@ def TrainFundamentalFormPredictor(
 
 				# Only compute if batch has valid points
 				if jnp.sum(batch_mask) > 0:
-					val_loss, val_eikonality_loss = validation_loss(
-						val_mask,
-						batch_mask,
-						val_pos,
-						val_norm,
-						val_weights,
-						batch_queries,
-						batch_distances,
-						knn_blend=knn_blend,
-					)
-					batch_val_losses.append(val_loss)
-					batch_val_eikonality_losses.append(val_eikonality_loss)
+					# The batch's mean errors from chunks of VALIDATION_CHUNK rows (sums over the chunks' valid queries):
+					# the same values up to rounding, with the memory of one chunk.
+					sums = np.zeros(4)
+					for c0 in range(0, batch_size, VALIDATION_CHUNK):
+						c1 = min(c0 + VALIDATION_CHUNK, batch_size)
+						dl, el, nd, ne = validation_loss(
+							val_mask,
+							batch_mask[c0:c1],
+							val_pos,
+							val_norm,
+							val_weights,
+							batch_queries[c0:c1],
+							batch_distances[c0:c1],
+							knn_blend=knn_blend,
+						)
+						sums += [float(dl) * float(nd), float(el) * float(ne), float(nd), float(ne)]
+					batch_val_losses.append(sums[0] / sums[2] if sums[2] > 0 else 0.0)
+					batch_val_eikonality_losses.append(sums[1] / sums[3] if sums[3] > 0 else 0.0)
 
 			# Average over batches for this shape
 			if len(batch_val_losses) > 0:

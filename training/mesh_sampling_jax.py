@@ -694,6 +694,7 @@ def generate_neighborhood_features(
 	narrow_band_offset: float = 0.2,
 	bbox_extension: float = 1.0,
 	use_unsigned_distance: bool = False,
+	keys: jax.Array = None,
 ) -> Tuple[jax.Array, jax.Array]:
 	"""
 	Generate query points and ground-truth distances for the given neighborhoods (point positions of each).
@@ -707,6 +708,7 @@ def generate_neighborhood_features(
 		n_queries: Total queries per neighborhood (must be divisible by 3)
 		narrow_band_offset: Half-width of narrow band
 		bbox_extension: Extension factor
+		keys: (n_neighborhoods,) per-neighborhood keys (default: jax.random.split(key, n_neighborhoods); key is then unused)
 
 	Returns:
 		queries: (n_neighborhoods, n_queries, 3) query points per neighborhood
@@ -723,7 +725,8 @@ def generate_neighborhood_features(
 	bbox_maxs = jnp.max(neighbor_positions, axis=1)
 
 	# Generate keys for each neighborhood
-	keys = jax.random.split(key, n_points)
+	if keys is None:
+		keys = jax.random.split(key, n_points)
 
 	# Vectorized query generation
 	def gen_queries_for_point(i):
@@ -756,8 +759,51 @@ def generate_neighborhood_features(
 	return queries, distances
 
 
-@partial(jit, static_argnames=['n_queries', 'use_unsigned_distance'])
 def generate_shape_features(
+	positions: jax.Array,  # (n_points, 3)
+	neighbors: jax.Array,  # (n_points, k) - neighbor indices
+	vertices: jax.Array,  # (max_vertices, 3)
+	faces: jax.Array,  # (max_faces, 3)
+	face_mask: jax.Array,  # (max_faces,)
+	key: jax.random.PRNGKey,
+	n_queries: int = 120,
+	narrow_band_offset: float = 0.2,
+	bbox_extension: float = 1.0,
+	use_unsigned_distance: bool = False,
+	chunk: int = 0,
+) -> Tuple[jax.Array, jax.Array]:
+	"""
+	Generate query points and ground-truth distances for all neighborhoods in a shape
+	(generate_neighborhood_features of positions[neighbors]).
+
+	chunk > 0: in chunks of that many neighborhoods (with the per-neighborhood keys of the whole shape: the same
+	queries and distances, with the memory of one chunk). 0: all at once.
+
+	Returns:
+		queries: (n_points, n_queries, 3) query points per neighborhood
+		distances: (n_points, n_queries) ground-truth signed distances
+	"""
+	n_points = neighbors.shape[0]
+	kw = dict(
+		n_queries=n_queries,
+		narrow_band_offset=narrow_band_offset,
+		bbox_extension=bbox_extension,
+		use_unsigned_distance=use_unsigned_distance,
+	)
+	if not chunk or chunk >= n_points:
+		return _generate_shape_features(positions, neighbors, vertices, faces, face_mask, key, **kw)
+	keys = jax.random.split(key, n_points)
+	qs, ds = [], []
+	for s in range(0, n_points, chunk):
+		idx = jnp.arange(s, s + chunk) % n_points  # the last chunk wraps around (one compiled shape); cut below
+		q, d = generate_neighborhood_features(positions[neighbors[idx]], vertices, faces, face_mask, key, keys=keys[idx], **kw)
+		qs.append(q)
+		ds.append(d)
+	return jnp.concatenate(qs)[:n_points], jnp.concatenate(ds)[:n_points]
+
+
+@partial(jit, static_argnames=['n_queries', 'use_unsigned_distance'])
+def _generate_shape_features(
 	positions: jax.Array,  # (n_points, 3)
 	neighbors: jax.Array,  # (n_points, k) - neighbor indices
 	vertices: jax.Array,  # (max_vertices, 3)
