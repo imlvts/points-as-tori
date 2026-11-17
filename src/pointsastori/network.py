@@ -1122,6 +1122,24 @@ def geometric_input_features(coordinates, local_normals):
 	)
 
 
+class CrossAttentionBlock(nnx.Module):
+	"""Pre-norm cross-attention block: queries x attend to context y, then a feed-forward block on x."""
+
+	def __init__(self, embed_dim: int, n_heads: int, mlp_dim: int, *, rngs: nnx.Rngs):
+		self.attention = nnx.MultiHeadAttention(
+			num_heads=n_heads, in_features=embed_dim, qkv_features=embed_dim, out_features=embed_dim, decode=False, rngs=rngs
+		)
+		self.ffn = nnx.Sequential(nnx.Linear(embed_dim, mlp_dim, rngs=rngs), nnx.gelu, nnx.Linear(mlp_dim, embed_dim, rngs=rngs))
+		self.norm_q = nnx.LayerNorm(embed_dim, rngs=rngs)
+		self.norm_kv = nnx.LayerNorm(embed_dim, rngs=rngs)
+		self.norm2 = nnx.LayerNorm(embed_dim, rngs=rngs)
+
+	def __call__(self, x: jax.Array, y: jax.Array) -> jax.Array:
+		kv = self.norm_kv(y)
+		x = x + self.attention(self.norm_q(x), kv, kv)
+		return x + self.ffn(self.norm2(x))
+
+
 class InputFeatures(nnx.Module):
 	"""
 	Turn a neighborhood (point positions & their normals) to the input features to be fed into the neural network.
@@ -1217,6 +1235,10 @@ FRAMES = ('legacy', 'continuous', 'invariant')
 ARCH_DEFAULTS = dict(
 	frame='legacy',  # tangent frame of the input features (see continuous_frame, invariant_frames)
 	input_mlp=False,  # geometric input features through a 2-layer MLP (geometric_input_features)
+	encoder='transformer',  # 'transformer' (the authors' n_layers blocks) or 'perceiver' (latent cross-attention)
+	n_latents=8,  # perceiver: number of latent tokens
+	n_cross=2,  # perceiver: cross-attention blocks (latents <- neighbour tokens)
+	n_self=2,  # perceiver: latent self-attention blocks after each cross-attention
 )
 
 
@@ -1249,9 +1271,33 @@ class FundamentalFormPredictor(nnx.Module):
 
 		self.input_encoder = InputFeatures(embed_dim, n_freq=n_freq, input_mlp=self.arch['input_mlp'], rngs=rngs)
 
-		self.blocks = nnx.List(
-			[TransformerBlock(embed_dim, n_heads, mlp_dim, dropout_rate, rngs=rngs) for _ in range(n_layers)]
-		)
+		if self.arch['encoder'] == 'perceiver':
+			# --encoder perceiver: a pointwise MLP on the k neighbour tokens, n_latents learned latent tokens that
+			# cross-attend to them (n_cross times), each cross-attention followed by n_self latent self-attention blocks;
+			# readout: the mean of the latents. No k x k attention and no per-token FFN after the first MLP.
+			self.blocks = nnx.List([])
+			self.latents = nnx.Param(0.02 * jax.random.normal(rngs.params(), (self.arch['n_latents'], embed_dim)))
+			self.token_mlp = nnx.Sequential(
+				nnx.LayerNorm(embed_dim, rngs=rngs),
+				nnx.Linear(embed_dim, embed_dim, rngs=rngs),
+				nnx.gelu,
+				nnx.Linear(embed_dim, embed_dim, rngs=rngs),
+			)
+			self.cross_blocks = nnx.List(
+				[CrossAttentionBlock(embed_dim, n_heads, mlp_dim, rngs=rngs) for _ in range(self.arch['n_cross'])]
+			)
+			self.latent_blocks = nnx.List(
+				[
+					TransformerBlock(embed_dim, n_heads, mlp_dim, dropout_rate, rngs=rngs)
+					for _ in range(self.arch['n_cross'] * self.arch['n_self'])
+				]
+			)
+		elif self.arch['encoder'] == 'transformer':
+			self.blocks = nnx.List(
+				[TransformerBlock(embed_dim, n_heads, mlp_dim, dropout_rate, rngs=rngs) for _ in range(n_layers)]
+			)
+		else:
+			raise ValueError(f"encoder {self.arch['encoder']!r}: expected transformer or perceiver")
 
 		self.final_norm = nnx.LayerNorm(embed_dim, rngs=rngs)
 
@@ -1318,9 +1364,19 @@ class FundamentalFormPredictor(nnx.Module):
 		"""The network on neighborhoods expressed in the tangent frame (s_hat, t_hat) ([batch, 1, 3] each) -> the six
 		coefficients in that frame, scaled back to world units."""
 		x, scale = self.input_encoder(positions, normals, basis=(s_hat, t_hat))
-		for block in self.blocks:
-			x = block(x)
-		x = self.final_norm(x)[:, 0, :]
+		if self.arch['encoder'] == 'perceiver':
+			tokens = x + self.token_mlp(x)
+			lat = jnp.broadcast_to(self.latents[...], (x.shape[0],) + self.latents.shape)
+			n_self = self.arch['n_self']
+			for i, cross in enumerate(self.cross_blocks):
+				lat = cross(lat, tokens)
+				for block in self.latent_blocks[i * n_self : (i + 1) * n_self]:
+					lat = block(lat)
+			x = jnp.mean(self.final_norm(lat), axis=1)
+		else:
+			for block in self.blocks:
+				x = block(x)
+			x = self.final_norm(x)[:, 0, :]
 		c = self.mlp(x)
 		return jnp.stack([c[:, 0] * scale, c[:, 1], c[:, 2], c[:, 3] / scale, c[:, 4] / scale, c[:, 5] / scale], axis=-1)
 

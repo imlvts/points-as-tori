@@ -1394,6 +1394,17 @@ def parse_args(argv=None):
 		'on the 6 raw ones. Saved with the model',
 	)
 	ap.add_argument(
+		'--encoder',
+		choices=['transformer', 'perceiver'],
+		default='transformer',
+		help="architecture: transformer: the authors' 8 blocks of 64 x 64 self-attention; perceiver: a pointwise MLP on "
+		'the 64 neighbour tokens, --latents learned latent tokens cross-attending to them --cross-layers times, each '
+		'followed by --self-layers latent self-attention blocks, readout = mean of the latents. Saved with the model',
+	)
+	ap.add_argument('--latents', type=int, default=8, help='perceiver: number of latent tokens')
+	ap.add_argument('--cross-layers', type=int, default=2, help='perceiver: number of cross-attention blocks')
+	ap.add_argument('--self-layers', type=int, default=2, help='perceiver: latent self-attention blocks per cross-attention')
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1446,8 +1457,10 @@ def main(argv=None):
 
 def arch_options(a):
 	"""The architecture options of the command line that differ from the authors' network (network.ARCH_DEFAULTS)."""
-	opts = dict(frame=a.frame, input_mlp=a.input_mlp)
-	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k]}
+	opts = dict(frame=a.frame, input_mlp=a.input_mlp, encoder=a.encoder)
+	if a.encoder == 'perceiver':
+		opts.update(n_latents=a.latents, n_cross=a.cross_layers, n_self=a.self_layers)
+	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k] or k in ('n_latents', 'n_cross', 'n_self')}
 
 
 if __name__ == '__main__':
