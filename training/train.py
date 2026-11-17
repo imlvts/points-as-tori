@@ -483,6 +483,7 @@ def TrainFundamentalFormPredictor(
 	seed_area=False,
 	resample_decimated=0,
 	resample_analytic='',
+	union_k=0,
 ):
 	"""
 	Args:
@@ -517,6 +518,8 @@ def TrainFundamentalFormPredictor(
 		resample_decimated: with resample: meshes decimated to the face limit of the data (all faces valid, 2048) are
 			resampled to at most this many points (0: off)
 		resample_analytic: 'LO:HI': the point counts of the analytic scenes of mix (default: those of resample)
+		union_k: with multishape: > k: the patch union also holds the union_k nearest points of every centre (a halo
+			for the blend of queries near the patch rim; augment.make_patch) (0: off)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -915,7 +918,7 @@ def TrainFundamentalFormPredictor(
 				N = augment.perturb_normals(N, normal_noise, rng)
 			patch, curv = augment.make_patch(
 				P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng,
-				point_data=np.stack([k1, k2], -1), hole=hole, seed_area=seed_area,
+				point_data=np.stack([k1, k2], -1), hole=hole, seed_area=seed_area, union_k=union_k,
 			)
 			return patch + ('analytic', (E, types, polys, pcount, R), {'curv': curv})
 
@@ -939,7 +942,8 @@ def TrainFundamentalFormPredictor(
 					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise, resample_decimated
 				)
 				patch = augment.make_patch(
-					P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole, seed_area=seed_area
+					P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole, seed_area=seed_area,
+					union_k=union_k,
 				)
 				patches.append(patch + (V, F, FM, {}))
 			return patches
@@ -1631,6 +1635,14 @@ def parse_args(argv=None):
 	ap.add_argument('--patch-c', type=int, default=32, help='query centres per patch (--multishape)')
 	ap.add_argument('--upad', type=int, default=256, help='patch union size, padded (--multishape)')
 	ap.add_argument(
+		'--union-k',
+		type=int,
+		default=0,
+		metavar='K2',
+		help='with --multishape: the patch union also holds the K2 nearest points of every centre (halo; raise --upad to '
+		'keep them; 0: off)',
+	)
+	ap.add_argument(
 		'--save-every', type=int, default=10000, help='checkpoint and validation every N steps (--multishape; 0: at the end)'
 	)
 	ap.add_argument(
@@ -1817,6 +1829,7 @@ def main(argv=None):
 		seed_area=a.seed_area,
 		resample_decimated=a.resample_decimated,
 		resample_analytic=a.resample_analytic,
+		union_k=a.union_k,
 	)
 
 

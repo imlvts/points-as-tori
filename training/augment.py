@@ -97,7 +97,7 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 	return P, N, NB, M, V, F, FM, tree
 
 
-def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole=None, seed_area=False):
+def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole=None, seed_area=False, union_k=0):
 	"""
 	Args:
 		P, N: (n, 3) points and normals; NB: (n, k) neighbors or None (then tree, a cKDTree of P, gives them);
@@ -111,6 +111,9 @@ def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole
 		seed_area: draw the seed with probability ~ s_i^2 (s_i: distance to the 8th nearest neighbour, s_i^2 ~ the
 			surface area per point) instead of uniformly over the points, by sampling-importance-resampling from 64
 			uniform candidates (exact in the limit, cheap on every cloud).
+		union_k: > k: U also contains the union_k nearest points of every centre (a halo: the blend of a query near
+			the patch rim then sees the points that are among its nearest in the whole cloud); the network inputs stay
+			the k-NN. Points beyond upad are dropped farthest from the seed first, i.e. halo points first.
 
 	Returns:
 		UP, UN: (upad, k, 3) network inputs (neighborhoods of the points of U)
@@ -153,6 +156,13 @@ def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole
 	else:
 		centres = tree.query(P[seed], k=n_centres)[1]
 		U = np.unique(tree.query(P[centres], k=k)[1].ravel())
+	if union_k > k:
+		if NB is not None:
+			nv = np.nonzero(M)[0]
+			halo = nv[cKDTree(P[nv]).query(P[centres], k=min(union_k, len(nv)))[1].ravel()]
+		else:
+			halo = tree.query(P[centres], k=min(union_k, len(P)))[1].ravel()
+		U = np.unique(np.concatenate([U, halo]))
 	U = U[U >= 0]
 	U = U[M[U]]
 	u = len(U)
