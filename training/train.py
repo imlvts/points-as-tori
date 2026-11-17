@@ -790,6 +790,8 @@ def TrainFundamentalFormPredictor(
 				save_model(model, f'step{step}')
 				if val_positions is not None:
 					val_loss, val_eikonality_loss = run_validation(jax.random.fold_in(key, 0))
+					validation_losses.append(val_loss)
+					validation_epochs.append(len(all_train_losses) - 1)
 					print(f'	{"validation:":<{LABEL_WIDTH}}{val_loss:<{VALUE_WIDTH}.6f}'
 						f'{"eikonality:":<{LABEL_WIDTH}}{val_eikonality_loss:<{VALUE_WIDTH}.6f}', flush=True)
 					nnx.train_mode(model)
