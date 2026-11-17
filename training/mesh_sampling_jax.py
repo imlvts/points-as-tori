@@ -560,9 +560,14 @@ def sample_zero_set_and_band_local(
 	If fewer than n candidates are accepted, accepted ones are reused; if none are (degenerate box), the neighborhood
 	points themselves (which lie on the surface) are used.
 
+	offset: the band half-width, a scalar (world units) or traced (e.g. relative to the neighborhood scale).
+
 	Returns:
 		zero_samples: (n, 3)
 		band_samples: (n, 3)
+		zero_normals: (n, 3) face normals of the zero-set samples (zero for fallback samples)
+		band_normals: (n, 3) face normals of the faces the band samples were offset from (zero for fallback samples)
+		band_offsets: (n,) the signed offsets of the band samples along band_normals
 	"""
 	safe_faces = jnp.maximum(faces, 0)
 	v0 = vertices[safe_faces[:, 0]]
@@ -597,10 +602,19 @@ def sample_zero_set_and_band_local(
 	fallback = neighborhood_points[jnp.arange(n) % neighborhood_points.shape[0]]
 	zero_samples = jnp.where(n_zero > 0, candidates[zero_idx], fallback)
 	band_samples = jnp.where(n_band > 0, band[band_idx], fallback)
-	return zero_samples, band_samples
+	cand_normals = face_normals[face_indices]
+	zero_normals = jnp.where(n_zero > 0, cand_normals[zero_idx], 0.0)
+	band_normals = jnp.where(n_band > 0, cand_normals[band_idx], 0.0)
+	band_offsets = jnp.where(n_band > 0, offsets[band_idx], 0.0)
+	return zero_samples, band_samples, zero_normals, band_normals, band_offsets
 
 
-@partial(jit, static_argnames=['n_queries', 'n_queries_per_type'])
+def neighborhood_scale(neighborhood_points: jax.Array) -> jax.Array:
+	"""sigma of a neighborhood (k, 3) whose row 0 is its centre: the median distance to the centre (the network's scale)."""
+	return jnp.median(jnp.linalg.norm(neighborhood_points - neighborhood_points[:1], axis=-1))
+
+
+@partial(jit, static_argnames=['n_queries', 'n_queries_per_type', 'return_normals'])
 def generate_queries_for_neighborhood(
 	bbox_min: jax.Array,  # (3,)
 	bbox_max: jax.Array,  # (3,)
@@ -615,6 +629,9 @@ def generate_queries_for_neighborhood(
 	n_queries_per_type: int = 40,  # n_queries // 3
 	narrow_band_offset: float = 0.2,
 	bbox_extension: float = 1.0,
+	band_sigma: float = 0.0,
+	min_extent_sigma: float = 0.0,
+	return_normals: bool = False,
 ) -> jax.Array:
 	"""
 	Generate query points for a single neighborhood.
@@ -636,15 +653,23 @@ def generate_queries_for_neighborhood(
 		n_queries_per_type: Queries per type (n_queries // 3)
 		narrow_band_offset: Half-width of narrow band
 		bbox_extension: Multiplicative extension factor
+		band_sigma: > 0: the band half-width is band_sigma * sigma (neighborhood_scale) instead of narrow_band_offset
+		min_extent_sigma: > 0: the minimum extent of the regularized box is min_extent_sigma * sigma instead of 0.1
+		return_normals: also return the face normals of the zero-set and band samples (zero where unknown) and the
+			signed band offsets
 
 	Returns:
 		queries: (n_queries, 3) query points
+		(return_normals) normals: (n_queries, 3), zero for the cube samples; offsets: (n_queries,), nonzero for band samples
 	"""
 	# Regularize bbox
 	bbox_diag = bbox_max - bbox_min
 	bbox_extents = jnp.abs(bbox_diag)
 	bbox_center = 0.5 * (bbox_max + bbox_min)
-	bbox_extents = jnp.maximum(bbox_extents, 0.1)  # Min extent
+	sigma = neighborhood_scale(neighborhood_points)
+	min_extent = jnp.where(min_extent_sigma > 0, min_extent_sigma * sigma, 0.1)
+	narrow_band_offset = jnp.where(band_sigma > 0, band_sigma * sigma, narrow_band_offset)
+	bbox_extents = jnp.maximum(bbox_extents, min_extent)  # Min extent
 	bbox_min_reg = bbox_center - 0.5 * bbox_extents
 	bbox_max_reg = bbox_center + 0.5 * bbox_extents
 
@@ -659,7 +684,7 @@ def generate_queries_for_neighborhood(
 	bbox_max_ext = bbox_center + radius * diag * bbox_extension
 
 	# Zero set and narrow band samples
-	zero_samples, narrow_samples = sample_zero_set_and_band_local(
+	zero_samples, narrow_samples, zero_normals, band_normals, band_offsets = sample_zero_set_and_band_local(
 		bbox_min_reg,
 		bbox_max_reg,
 		bbox_min_ext,
@@ -680,10 +705,14 @@ def generate_queries_for_neighborhood(
 	# Concatenate all samples
 	queries = jnp.concatenate([zero_samples, narrow_samples, bbox_samples], axis=0)
 
+	if return_normals:
+		normals = jnp.concatenate([zero_normals, band_normals, jnp.zeros_like(bbox_samples)], axis=0)
+		offsets = jnp.concatenate([jnp.zeros(n_queries_per_type), band_offsets, jnp.zeros(bbox_samples.shape[0])])
+		return queries, normals, offsets
 	return queries
 
 
-@partial(jit, static_argnames=['n_queries', 'use_unsigned_distance'])
+@partial(jit, static_argnames=['n_queries', 'use_unsigned_distance', 'return_normals'])
 def generate_neighborhood_features(
 	neighbor_positions: jax.Array,  # (n_neighborhoods, k, 3)
 	vertices: jax.Array,  # (max_vertices, 3)
@@ -694,6 +723,9 @@ def generate_neighborhood_features(
 	narrow_band_offset: float = 0.2,
 	bbox_extension: float = 1.0,
 	use_unsigned_distance: bool = False,
+	band_sigma: float = 0.0,
+	min_extent_sigma: float = 0.0,
+	return_normals: bool = False,
 ) -> Tuple[jax.Array, jax.Array]:
 	"""
 	Generate query points and ground-truth distances for the given neighborhoods (point positions of each).
@@ -707,10 +739,16 @@ def generate_neighborhood_features(
 		n_queries: Total queries per neighborhood (must be divisible by 3)
 		narrow_band_offset: Half-width of narrow band
 		bbox_extension: Extension factor
+		band_sigma, min_extent_sigma: band half-width and minimum box extent relative to each neighborhood's scale
+			(see generate_queries_for_neighborhood; 0: the world-unit values narrow_band_offset and 0.1)
+		return_normals: also return the true SDF gradients of the queries where known: the face normal at zero-set
+			samples, and at band samples whose ground-truth distance equals their offset along the face normal (their
+			closest mesh point is the sample they were offset from); zero elsewhere (cube samples, fallbacks)
 
 	Returns:
 		queries: (n_neighborhoods, n_queries, 3) query points per neighborhood
 		distances: (n_neighborhoods, n_queries) ground-truth signed distances
+		(return_normals) normals: (n_neighborhoods, n_queries, 3)
 	"""
 	n_points = neighbor_positions.shape[0]
 	n_queries_per_type = n_queries // 3
@@ -741,9 +779,15 @@ def generate_neighborhood_features(
 			n_queries_per_type,
 			narrow_band_offset,
 			bbox_extension,
+			band_sigma,
+			min_extent_sigma,
+			return_normals,
 		)
 
-	queries = jax.vmap(gen_queries_for_point)(jnp.arange(n_points))  # (n_points, n_queries, 3)
+	if return_normals:
+		queries, normals, offsets = jax.vmap(gen_queries_for_point)(jnp.arange(n_points))
+	else:
+		queries = jax.vmap(gen_queries_for_point)(jnp.arange(n_points))  # (n_points, n_queries, 3)
 
 	# Compute signed distances for all queries
 	def compute_distances_for_point(point_queries):
@@ -753,6 +797,11 @@ def generate_neighborhood_features(
 
 	distances = jax.vmap(compute_distances_for_point)(queries)  # (n_points, n_queries)
 
+	if return_normals:
+		n_type = n_queries_per_type
+		is_band = (jnp.arange(n_queries) >= n_type) & (jnp.arange(n_queries) < 2 * n_type)
+		ok = ~is_band[None] | (jnp.abs(distances - offsets) <= 1e-5 + 1e-3 * jnp.abs(offsets))
+		return queries, distances, jnp.where(ok[..., None], normals, 0.0)
 	return queries, distances
 
 
