@@ -213,11 +213,13 @@ def FundamentalFormPredictorTrainer(
 	knn_blend=0,
 	clip=0.0,
 	eikonal_weight=1.0,
+	arch=None,
 ):
 	"""
 	Set up network (model) with the given parameters.
 	eikonal_weight: weight of the eikonality term of the loss
 	clip: clip the gradient to this global norm before the AdamW update (0: no clipping)
+	arch: architecture options of FundamentalFormPredictor (network.ARCH_DEFAULTS; None: the authors' network)
 
 	Returns: (model, optimizer, train_step) where train_step() is a function that trains the model for a single step.
 	"""
@@ -229,6 +231,7 @@ def FundamentalFormPredictorTrainer(
 		mlp_dim=mlp_dim,
 		dropout_rate=dropout_rate,
 		rngs=rngs,
+		**(arch or {}),
 	)
 
 	# Learning rate schedule
@@ -384,6 +387,7 @@ def TrainFundamentalFormPredictor(
 	noise=0.0,
 	quantize=0.0,
 	mix='',
+	arch=None,
 ):
 	"""
 	Args:
@@ -415,6 +419,8 @@ def TrainFundamentalFormPredictor(
 		mix: 'analytic:FRAC:PATH' with multishape: each patch slot is, with probability FRAC, a patch of an analytic scene
 			of PATH (gen_analytic.py) with exact-SDF queries (analytic_sdf.analytic_queries) instead of a data shape;
 			resample and rotate apply to the analytic scenes too ('': off)
+		arch: architecture options of the network (network.ARCH_DEFAULTS; None or {}: the authors' network); saved with
+			the weights, and a warm start (load_model_path) must have the same
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -467,6 +473,7 @@ def TrainFundamentalFormPredictor(
 		knn_blend=knn_blend,
 		clip=clip,
 		eikonal_weight=eikonal_weight,
+		arch=arch,
 	)
 
 	# Load pretrained model if specified ('random' or None: keep the fresh initialization)
@@ -481,6 +488,7 @@ def TrainFundamentalFormPredictor(
 		assert saved_data['n_heads'] == n_heads, 'n_heads mismatch'
 		assert saved_data['n_layers'] == n_layers, 'n_layers mismatch'
 		assert saved_data['mlp_dim'] == mlp_dim, 'mlp_dim mismatch'
+		assert saved_data.get('arch', {}) == (arch or {}), f"architecture options mismatch: {saved_data.get('arch', {})} vs {arch or {}}"
 
 		# Load parameters into model
 		nnx.update(model, saved_data['params'])
@@ -574,6 +582,8 @@ def TrainFundamentalFormPredictor(
 			'k_neighbors': k_neighbors,
 			'dropout_rate': dropout_rate,
 		}
+		if arch:
+			saved_data['arch'] = dict(arch)  # architecture options (load_saved_model restores them)
 
 		model_name = f'FundamentalFormPredictor_{epoch}' if save_filepath is None else save_filepath
 		os.makedirs(models_dir, exist_ok=True)
@@ -1367,6 +1377,14 @@ def parse_args(argv=None):
 		'--min-points', type=int, default=0, help='drop training shapes with fewer valid points (0: keep all)'
 	)
 	ap.add_argument(
+		'--frame',
+		choices=['legacy', 'continuous'],
+		default='legacy',
+		help="architecture: tangent frame of the network input. legacy: the authors' (jumps at |n_x| = 0.9); continuous: "
+		"Frisvad's frame, continuous except at one direction; the prediction is rotated into the legacy frame, so the "
+		'torus fits (and the C++ inference) are unchanged. Saved with the model',
+	)
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1413,7 +1431,14 @@ def main(argv=None):
 		noise=a.noise,
 		quantize=a.quantize,
 		mix=a.mix,
+		arch=arch_options(a),
 	)
+
+
+def arch_options(a):
+	"""The architecture options of the command line that differ from the authors' network (network.ARCH_DEFAULTS)."""
+	opts = dict(frame=a.frame)
+	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k]}
 
 
 if __name__ == '__main__':

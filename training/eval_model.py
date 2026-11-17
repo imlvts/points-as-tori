@@ -63,6 +63,7 @@ def load_model(path):
 			mlp_dim=cfg['mlp_dim'],
 			dropout_rate=0.0,
 			rngs=nnx.Rngs(0),
+			**cfg.get('arch', {}),
 		)
 		state = nnx.state(model, nnx.Param)
 		leaves, treedef = jax.tree_util.tree_flatten_with_path(state)

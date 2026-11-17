@@ -80,6 +80,70 @@ def orthonormal_basis_with_rotation(n: jnp.ndarray, rotation: float) -> Tuple[jn
 	return s_hat, t_hat
 
 
+# ------------------------------------------------------------------------
+# Tangent frames of the network input (FundamentalFormPredictor frame='continuous').
+#
+# The six coefficients are always read in the frame above (the "legacy" frame, also the C++ fit_torus_at_point's), whose
+# reference vector switches at |n_x| = 0.9: on that circle the in-plane axes jump. A model with another input frame
+# computes its features there and rotates its prediction into the legacy frame (rotate_coeffs), so the torus fits of
+# training and inference are unchanged and the predicted torus no longer depends on the legacy frame.
+#
+# No tangent frame field on the sphere is continuous everywhere (hairy ball theorem). The frame below (Frisvad 2012,
+# the frame of the rotation that takes the pole axis to n along a great circle) is continuous and smooth except at a
+# single direction, the pole. Duff et al. 2017's branchless variant is NOT used: its copysign(1, n_z) makes the axes
+# jump by 180 degrees across the whole equator n_z = 0. The pole is put at a direction that is not a likely CAD
+# face normal (not axis-aligned, not a face diagonal).
+# ------------------------------------------------------------------------
+
+_POLE = np.array([-1.0, -2.0, -3.0]) / np.sqrt(14.0)
+_E3 = -_POLE
+_E1 = np.cross(_E3, [1.0, 0.0, 0.0])
+_E1 /= np.linalg.norm(_E1)
+_E2 = np.cross(_E3, _E1)
+# Rows: a right-handed basis whose third axis is -pole; POLE_ROTATION @ pole = (0, 0, -1).
+POLE_ROTATION = np.stack([_E1, _E2, _E3]).astype(np.float32)
+
+
+def continuous_frame(n: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+	"""
+	Orthonormal (s, t) perpendicular to the unit vectors n (..., 3), right-handed with t = n x s like the legacy frame,
+	continuous (smooth) in n except at n = pole. In coordinates m = POLE_ROTATION n (pole at m = -z) this is Frisvad's
+	frame s = (1 - m_x^2 c, -m_x m_y c, -m_x), c = 1 / (1 + m_z), with 1 + m_z = (m_x^2 + m_y^2) / (1 - m_z) for m_z < 0
+	(no cancellation near the pole).
+	"""
+	Q = jnp.asarray(POLE_ROTATION, n.dtype)
+	n_hat = n / jnp.maximum(jnp.linalg.norm(n, axis=-1, keepdims=True), NAN_EPSILON)
+	m = jnp.einsum('ij,...j->...i', Q, n_hat)
+	mx, my, mz = m[..., 0], m[..., 1], m[..., 2]
+	rho2 = mx * mx + my * my
+	one_plus_mz = jnp.where(mz >= 0, 1.0 + mz, rho2 / (1.0 - mz))
+	at_pole = one_plus_mz < 1e-30
+	c = 1.0 / jnp.where(at_pole, 1.0, one_plus_mz)
+	s_m = jnp.stack([1.0 - mx * mx * c, -mx * my * c, -mx], axis=-1)
+	s_m = jnp.where(at_pole[..., None], jnp.array([1.0, 0.0, 0.0], n.dtype), s_m)
+	s = jnp.einsum('ji,...j->...i', Q, s_m)  # back to world coordinates: Q^T s_m
+	s = s - jnp.sum(s * n_hat, axis=-1, keepdims=True) * n_hat
+	s = s / jnp.maximum(jnp.linalg.norm(s, axis=-1, keepdims=True), NAN_EPSILON)
+	t = jnp.cross(n_hat, s)
+	return s, t
+
+
+def rotate_coeffs(c: jnp.ndarray, cos_phi: jnp.ndarray, sin_phi: jnp.ndarray) -> jnp.ndarray:
+	"""
+	Coefficients (a00, a01, a10, a11, a02, a20) of the height h = a00 + a10 s' + a01 t' + a20 s'^2 + a11 s' t' + a02 t'^2
+	in the frame s' = cos_phi s + sin_phi t, t' = -sin_phi s + cos_phi t -> the same quadric in the frame (s, t).
+	(The gradient (a10, a01) rotates as a vector, the Hessian as a symmetric tensor; a00 is invariant.)
+	"""
+	a00, a01, a10, a11, a02, a20 = [c[..., i] for i in range(6)]
+	co, si = cos_phi, sin_phi
+	b10 = co * a10 - si * a01
+	b01 = si * a10 + co * a01
+	b20 = a20 * co**2 - a11 * co * si + a02 * si**2
+	b11 = 2 * co * si * (a20 - a02) + (co**2 - si**2) * a11
+	b02 = a20 * si**2 + a11 * co * si + a02 * co**2
+	return jnp.stack([a00, b01, b10, b11, b02, b20], axis=-1)
+
+
 # ========================================================================
 # (AUTO-DIFFERENTIABLE) DISTANCE FUNCTIONS
 # ========================================================================
@@ -1031,9 +1095,13 @@ class InputFeatures(nnx.Module):
 		self,
 		positions: jax.Array,  # [batch, k, 3]
 		normals: jax.Array,  # [batch, k, 3]
+		basis=None,
 	) -> jax.Array:
 		"""
 		Compute geometric features relative to first point (center).
+
+		basis: None (the legacy frame orthonormal_basis_with_rotation(n, 0)) or (s_hat, t_hat), each [batch, 1, 3]: the
+			tangent frame of the local coordinates (FundamentalFormPredictor frame options).
 
 		Returns:
 			[batch, k, output_dim] geometric encodings
@@ -1058,7 +1126,7 @@ class InputFeatures(nnx.Module):
 
 		# The following block of code is copied from local_coordinates() above, because we also need the orthonormal basis.
 		center_point = normalized_positions[:, 0:1, :]  # [batch, 1, 3]
-		s_hat, t_hat = orthonormal_basis_with_rotation(center_normal, 0.0)
+		s_hat, t_hat = orthonormal_basis_with_rotation(center_normal, 0.0) if basis is None else basis
 
 		# Encode relative positions in local frame as (s, t, Q(s, t)) tuples.
 		diff_vectors = normalized_positions - center_point  # [batch, k, 3]
@@ -1079,6 +1147,14 @@ class InputFeatures(nnx.Module):
 		return self.mlp(geometric_features), median
 
 
+# Architecture options of FundamentalFormPredictor (train.py flags; saved with the weights). The defaults are the
+# authors' network.
+FRAMES = ('legacy', 'continuous')
+ARCH_DEFAULTS = dict(
+	frame='legacy',  # tangent frame of the input features (see continuous_frame)
+)
+
+
 class FundamentalFormPredictor(nnx.Module):
 	def __init__(
 		self,
@@ -1090,11 +1166,21 @@ class FundamentalFormPredictor(nnx.Module):
 		dropout_rate: float = 0.0,
 		*,
 		rngs: nnx.Rngs,
+		**arch,
 	):
 		"""
 		Args: Parameters for each TransformerBlock.
 			n_layers: Number of TransformerBlocks.
+			arch: architecture options (ARCH_DEFAULTS; all off by default = the authors' network). They are saved with
+				the weights (key 'arch' of a train.py .pkl) and restored by load_saved_model.
 		"""
+		unknown = set(arch) - set(ARCH_DEFAULTS)
+		if unknown:
+			raise ValueError(f'unknown architecture options {sorted(unknown)}')
+		self.arch = {**ARCH_DEFAULTS, **arch}
+		if self.arch['frame'] not in FRAMES:
+			raise ValueError(f"frame {self.arch['frame']!r}: expected one of {FRAMES}")
+		self.extended = self.arch != ARCH_DEFAULTS
 
 		self.input_encoder = InputFeatures(embed_dim, n_freq=n_freq, rngs=rngs)
 
@@ -1126,6 +1212,9 @@ class FundamentalFormPredictor(nnx.Module):
 		Returns:
 			coefficients: [batch, 6] (a00, a01, a10, a11, a02, a20)
 		"""
+		if self.extended:
+			return self.predict(positions, normals)[0]
+
 		batch_size, k, d = positions.shape
 
 		# input_features: [batch, k, embed_dim]
@@ -1159,6 +1248,34 @@ class FundamentalFormPredictor(nnx.Module):
 		)
 
 		return coeffs
+
+	def _forward_in_frame(self, positions, normals, s_hat, t_hat):
+		"""The network on neighborhoods expressed in the tangent frame (s_hat, t_hat) ([batch, 1, 3] each) -> the six
+		coefficients in that frame, scaled back to world units."""
+		x, scale = self.input_encoder(positions, normals, basis=(s_hat, t_hat))
+		for block in self.blocks:
+			x = block(x)
+		x = self.final_norm(x)[:, 0, :]
+		c = self.mlp(x)
+		return jnp.stack([c[:, 0] * scale, c[:, 1], c[:, 2], c[:, 3] / scale, c[:, 4] / scale, c[:, 5] / scale], axis=-1)
+
+	@nnx.jit
+	def predict(self, positions: jax.Array, normals: jax.Array):
+		"""
+		The network with its architecture options (self.arch) -> (coefficients [batch, 6] in the legacy frame, None).
+		"""
+		n0 = normals[:, 0:1, :]
+		n0 = n0 / jnp.maximum(jnp.linalg.norm(n0, axis=-1, keepdims=True), NAN_EPSILON)
+		s_leg, t_leg = orthonormal_basis_with_rotation(n0, 0.0)
+		if self.arch['frame'] == 'continuous':
+			s_hat, t_hat = continuous_frame(n0)
+		else:
+			s_hat, t_hat = s_leg, t_leg
+		c = self._forward_in_frame(positions, normals, s_hat, t_hat)
+		# the frame (s_hat, t_hat) is the legacy one rotated by phi: s_hat = cos phi s_leg + sin phi t_leg
+		cos_phi = jnp.sum(s_hat * s_leg, axis=-1)[:, 0]
+		sin_phi = jnp.sum(s_hat * t_leg, axis=-1)[:, 0]
+		return rotate_coeffs(c, cos_phi, sin_phi), None
 
 	def precompute_coefficients(self, points, normals, k_neighbors, outliers=np.array([])):
 		nnx.eval_mode(self)
@@ -1231,6 +1348,7 @@ class FundamentalFormPredictor(nnx.Module):
 			saved_data = pickle.load(f)
 
 		n_freq = saved_data['n_freq'] if 'n_freq' in saved_data else 0
+		arch = saved_data.get('arch', {})  # architecture options; absent in the released .pkl (= the defaults)
 
 		loaded_model = FundamentalFormPredictor(
 			embed_dim=saved_data['embed_dim'],
@@ -1240,6 +1358,7 @@ class FundamentalFormPredictor(nnx.Module):
 			mlp_dim=saved_data['mlp_dim'],
 			dropout_rate=saved_data['dropout_rate'],  # not used in eval mode
 			rngs=nnx.Rngs(0),  # not used in eval mode
+			**arch,
 		)
 
 		# Load saved parameters into the model
@@ -1255,5 +1374,7 @@ class FundamentalFormPredictor(nnx.Module):
 		print(f'  n_layers: {saved_data["n_layers"]}')
 		print(f'  mlp_dim: {saved_data["mlp_dim"]}')
 		print(f'  dropout_rate: {saved_data["dropout_rate"]}')
+		if arch:
+			print(f'  arch: {arch}')
 
 		return loaded_model, saved_data['k_neighbors']
