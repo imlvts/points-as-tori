@@ -725,6 +725,23 @@ def TrainFundamentalFormPredictor(
 				patches.append(patch + (V, F, FM))
 			return patches
 
+		# Queries of the data patches: one call vmapped over the patches, each with its key fold_in(step_key, j) (the same
+		# queries and distances as one generate_neighborhood_features call per patch; one dispatch instead of S)
+		data_queries = jax.jit(
+			jax.vmap(
+				lambda nbhds, V, F, FM, k: generate_neighborhood_features(
+					nbhds,
+					V,
+					F,
+					FM,
+					k,
+					n_queries=n_queries_per_neighborhood,
+					narrow_band_offset=narrow_band_offset,
+					bbox_extension=bbox_extension,
+				)
+			)
+		)
+
 		pool = concurrent.futures.ThreadPoolExecutor(1)
 		future = pool.submit(prepare, next_shapes())
 		step, log_buffer, union_sizes, t_log = 0, [], [], time.time()
@@ -733,7 +750,8 @@ def TrainFundamentalFormPredictor(
 			patches = future.result()
 			future = pool.submit(prepare, next_shapes())
 			step_key = jax.random.fold_in(key, step)
-			queries, distances = [], []
+			queries, distances = [None] * len(patches), [None] * len(patches)
+			data = []
 			for j, pt in enumerate(patches):
 				if isinstance(pt[7], str):  # analytic scene: exact-SDF queries
 					E, types, polys, pcount, R = pt[8]
@@ -747,24 +765,23 @@ def TrainFundamentalFormPredictor(
 						jax.random.fold_in(step_key, j),
 						bbox_extension=bbox_extension,
 					)
-					queries.append(q)
-					distances.append(d)
+					queries[j], distances[j] = q, d
 					union_sizes.append(pt[6])
 					n_analytic += 1
 					continue
-				q, d = generate_neighborhood_features(
-					jnp.asarray(pt[5]),
-					jnp.asarray(pt[7], jnp.float32),
-					jnp.asarray(pt[8]),
-					jnp.asarray(pt[9]),
-					jax.random.fold_in(step_key, j),
-					n_queries=n_queries_per_neighborhood,
-					narrow_band_offset=narrow_band_offset,
-					bbox_extension=bbox_extension,
-				)
-				queries.append(q)
-				distances.append(d)
+				data.append(j)
 				union_sizes.append(pt[6])
+			if data:
+				stack_data = lambda i, dtype=None: jnp.asarray(np.stack([patches[j][i] for j in data]), dtype)  # noqa: E731
+				q, d = data_queries(
+					stack_data(5),
+					stack_data(7, jnp.float32),
+					stack_data(8),
+					stack_data(9),
+					jnp.stack([jax.random.fold_in(step_key, j) for j in data]),
+				)
+				for n, j in enumerate(data):
+					queries[j], distances[j] = q[n], d[n]
 			stack = lambda i: jnp.asarray(np.stack([pt[i] for pt in patches]))  # noqa: E731
 			loss, loss_dict = patch_step(
 				model, optimizer, stack(0), stack(1), stack(2), stack(3), stack(4), jnp.stack(queries), jnp.stack(distances)
