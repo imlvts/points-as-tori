@@ -91,7 +91,7 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 	return P, N, NB, M, V, F, FM, tree
 
 
-def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole=None):
+def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole=None, seed_area=False):
 	"""
 	Args:
 		P, N: (n, 3) points and normals; NB: (n, k) neighbors or None (then tree, a cKDTree of P, gives them);
@@ -102,6 +102,9 @@ def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole
 			within r sigma of P[seed] + (r + 0.5) sigma t are removed (t a random unit tangent at the seed, sigma the
 			median distance of the seed's k-NN), so the hole's rim runs through the patch; the k-NN are recomputed.
 			The ground truth (mesh / exact SDF) is not changed: the network learns to close the gap.
+		seed_area: draw the seed with probability ~ s_i^2 (s_i: distance to the 8th nearest neighbour, s_i^2 ~ the
+			surface area per point) instead of uniformly over the points, by sampling-importance-resampling from 64
+			uniform candidates (exact in the limit, cheap on every cloud).
 
 	Returns:
 		UP, UN: (upad, k, 3) network inputs (neighborhoods of the points of U)
@@ -111,7 +114,16 @@ def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole
 		u: the size of U before padding
 	"""
 	valid = np.nonzero(M)[0]
-	seed = int(rng.choice(valid))
+	if seed_area:
+		cand = rng.choice(valid, 64)
+		if NB is not None:
+			s = np.linalg.norm(P[NB[cand, min(8, NB.shape[1] - 1)]] - P[cand], axis=-1)
+		else:
+			s = tree.query(P[cand], k=9)[0][:, -1]
+		w = s**2
+		seed = int(cand[rng.choice(64, p=w / w.sum())] if w.sum() > 0 else cand[0])
+	else:
+		seed = int(rng.choice(valid))
 	if hole is not None and rng.uniform() < hole[0]:
 		nbs = NB[seed] if NB is not None else tree.query(P[seed], k=k)[1]
 		sigma = float(np.median(np.linalg.norm(P[nbs] - P[seed], axis=-1)))

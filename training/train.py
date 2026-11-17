@@ -480,6 +480,7 @@ def TrainFundamentalFormPredictor(
 	ema=0.0,
 	normal_noise=0.0,
 	holes='',
+	seed_area=False,
 ):
 	"""
 	Args:
@@ -509,6 +510,8 @@ def TrainFundamentalFormPredictor(
 			shapes and analytic scenes; the ground truth stays exact; --aux-curv then drops its tilt terms) (0: off)
 		holes: 'P:R' with multishape: with probability P per patch, cut a hole of radius R sigma next to the seed
 			(augment.make_patch; the ground truth stays complete) ('': off)
+		seed_area: with multishape: patch seeds drawn with probability ~ the surface area per point (augment.make_patch)
+			instead of uniformly over the points
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -907,7 +910,7 @@ def TrainFundamentalFormPredictor(
 				N = augment.perturb_normals(N, normal_noise, rng)
 			patch, curv = augment.make_patch(
 				P, N, None, np.ones(len(P), bool), augment.cKDTree(P), k_neighbors, patch_centres, union_size, rng,
-				point_data=np.stack([k1, k2], -1), hole=hole,
+				point_data=np.stack([k1, k2], -1), hole=hole, seed_area=seed_area,
 			)
 			return patch + ('analytic', (E, types, polys, pcount, R), {'curv': curv})
 
@@ -930,7 +933,9 @@ def TrainFundamentalFormPredictor(
 				P, N, NB, M, V, F, FM, tree = augment.visit(
 					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise
 				)
-				patch = augment.make_patch(P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole)
+				patch = augment.make_patch(
+					P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole, seed_area=seed_area
+				)
 				patches.append(patch + (V, F, FM, {}))
 			return patches
 
@@ -1665,6 +1670,12 @@ def parse_args(argv=None):
 		'the patch seed (the ground truth stays complete; default: off)',
 	)
 	ap.add_argument(
+		'--seed-area',
+		action='store_true',
+		help='with --multishape: draw patch seeds with probability ~ surface area per point (s^2, s the 8th-neighbour '
+		'distance) instead of uniformly over the points (evens out unevenly sampled scans)',
+	)
+	ap.add_argument(
 		'--mix',
 		default='',
 		metavar='analytic:FRAC:PATH',
@@ -1784,6 +1795,7 @@ def main(argv=None):
 		ema=a.ema,
 		normal_noise=a.normal_noise,
 		holes=a.holes,
+		seed_area=a.seed_area,
 	)
 
 
