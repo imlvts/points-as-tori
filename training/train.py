@@ -482,6 +482,7 @@ def TrainFundamentalFormPredictor(
 	holes='',
 	seed_area=False,
 	resample_decimated=0,
+	resample_analytic='',
 ):
 	"""
 	Args:
@@ -515,6 +516,7 @@ def TrainFundamentalFormPredictor(
 			instead of uniformly over the points
 		resample_decimated: with resample: meshes decimated to the face limit of the data (all faces valid, 2048) are
 			resampled to at most this many points (0: off)
+		resample_analytic: 'LO:HI': the point counts of the analytic scenes of mix (default: those of resample)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -902,8 +904,8 @@ def TrainFundamentalFormPredictor(
 		def prepare_analytic():
 			i = int(rng.integers(len(scenes['sigma'])))
 			E, types, polys, pcount = scenes['prims'][i], scenes['types'][i], scenes['polys'][i], scenes['pcount'][i]
-			if resample:
-				n = int(rng.choice(augment.resample_counts(resample)))
+			if resample or resample_analytic:
+				n = int(rng.choice(augment.resample_counts(resample_analytic or resample)))
 				P, N, k1, k2, _, _ = analytic_scene.sample_scene(analytic_scene.decode(E, types, polys, pcount), n, rng)
 			else:
 				P, N, k1, k2 = scenes['P'][i], scenes['N'][i], scenes['k1'][i], scenes['k2'][i]
@@ -1650,6 +1652,12 @@ def parse_args(argv=None):
 		'MAX points (0: off)',
 	)
 	ap.add_argument(
+		'--resample-analytic',
+		default='',
+		metavar='MIN:MAX',
+		help='point counts of the analytic scenes of --mix (powers of two in [MIN, MAX]; default: those of --resample)',
+	)
+	ap.add_argument(
 		'--rotate', action='store_true', help='random rotation of every shape visit (points, normals, mesh)'
 	)
 	ap.add_argument(
@@ -1808,6 +1816,7 @@ def main(argv=None):
 		holes=a.holes,
 		seed_area=a.seed_area,
 		resample_decimated=a.resample_decimated,
+		resample_analytic=a.resample_analytic,
 	)
 
 
