@@ -32,6 +32,12 @@ MODELS_DIR = 'models/'
 # ========================================================================
 
 
+def sign_floor(x: jnp.ndarray, eps: float = NAN_EPSILON) -> jnp.ndarray:
+	"""x with |x| floored to eps, keeping its sign; +eps at x = 0 (the C++ sign(), shape_2d.h: sign(0) = +1).
+	jnp.sign(0) = 0 would turn the guard sign(x) * max(|x|, eps) into 0 at x = 0."""
+	return jnp.where(x >= 0, 1.0, -1.0) * jnp.maximum(jnp.abs(x), eps)
+
+
 @jit
 def orthonormal_basis_with_rotation(n: jnp.ndarray, rotation: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
 	"""
@@ -107,7 +113,7 @@ def cartesian_to_rotation_jax(u: jnp.ndarray) -> jnp.ndarray:
 	z = u_hat[..., 2]
 
 	phi = jnp.arccos(jnp.clip(z, -1.0, 1.0))
-	safe_x = jnp.sign(x) * jnp.maximum(jnp.abs(x), NAN_EPSILON)
+	safe_x = sign_floor(x)
 	theta = jnp.arctan2(y, safe_x)
 	return jnp.stack([theta, phi], axis=-1)
 
@@ -244,11 +250,11 @@ def torus_precompute_masked(
 		discriminant = jnp.sqrt(jnp.maximum(discriminant, NAN_EPSILON))  # sqrt not differentiable at 0
 
 		ev_pos_0 = v1 + discriminant
-		ev_pos_0 = jnp.sign(ev_pos_0) * jnp.maximum(jnp.abs(ev_pos_0), NAN_EPSILON)
+		ev_pos_0 = sign_floor(ev_pos_0)
 		ev_pos = jnp.array([ev_pos_0, v2])
 
 		ev_neg_1 = v2
-		ev_neg_1 = jnp.sign(ev_neg_1) * jnp.maximum(jnp.abs(ev_neg_1), NAN_EPSILON)
+		ev_neg_1 = sign_floor(ev_neg_1)
 		ev_neg = jnp.array([v1 - discriminant, ev_neg_1])
 
 		# Even though normalization isn't necessary because we take a Rayleigh quotient, it helps numerically.
@@ -287,7 +293,7 @@ def torus_precompute_masked(
 
 		numer_pos = ev_pos_x * II_ev_pos_x + ev_pos_y * II_ev_pos_y
 		denom_pos = ev_pos_x * I_ev_pos_x + ev_pos_y * I_ev_pos_y
-		denom_pos = jnp.sign(denom_pos) * jnp.maximum(jnp.abs(denom_pos), NAN_EPSILON)
+		denom_pos = sign_floor(denom_pos)
 		kappa_pos = numer_pos / denom_pos
 		# kappa_pos = jax.lax.cond(numer_pos == 0, lambda: NAN_EPSILON, lambda: numer_pos / denom_pos)
 
@@ -299,7 +305,7 @@ def torus_precompute_masked(
 
 		numer_neg = ev_neg_x * II_ev_neg_x + ev_neg_y * II_ev_neg_y
 		denom_neg = ev_neg_x * I_ev_neg_x + ev_neg_y * I_ev_neg_y
-		denom_neg = jnp.sign(denom_neg) * jnp.maximum(jnp.abs(denom_neg), NAN_EPSILON)
+		denom_neg = sign_floor(denom_neg)
 		kappa_neg = numer_neg / denom_neg
 		# kappa_neg = jax.lax.cond(numer_neg == 0, lambda: NAN_EPSILON, lambda: numer_neg / denom_neg)
 
