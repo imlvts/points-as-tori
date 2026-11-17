@@ -95,6 +95,7 @@ def SDF_loss(
 	distance_scale=None,
 	true_normals=None,
 	lipschitz_from=0,
+	aux=None,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -115,12 +116,14 @@ def SDF_loss(
 			normal (--normal-w; not added to the returned loss)
 		lipschitz_from: > 0: queries from this index on (the cube class) get the one-sided penalty max(0, |grad phi| - 1)
 			instead of |1 - |grad phi|| (--lipschitz-cube)
+		aux: None or (max_points, 2) --aux-heads logits (flip, confidence) of the points (network.aux_blend_terms)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
 
+	sign, log_weight = (None, None) if aux is None else aux_blend_terms(aux)
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
+		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend, point_sign=sign, log_weight=log_weight
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -184,11 +187,13 @@ def validation_loss(
 	queries,
 	true_distances,
 	knn_blend=0,
+	aux=None,
 ):
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
 
+	sign, log_weight = (None, None) if aux is None else aux_blend_terms(aux, hard=True)
 	predicted_distances, predicted_gradients = torus_distance_gradient_masked(
-		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend
+		mask, queries, positions, centers, axes, major_radii, minor_radii, knn=knn_blend, point_sign=sign, log_weight=log_weight
 	)
 
 	n_queries_per_neighborhood = queries.shape[1]
@@ -238,6 +243,7 @@ def FundamentalFormPredictorTrainer(
 	eikonal_weight=1.0,
 	schedule_fn=None,
 	count_offset=0,
+	arch=None,
 ):
 	"""
 	Set up network (model) with the given parameters.
@@ -246,6 +252,7 @@ def FundamentalFormPredictorTrainer(
 	schedule_fn: learning rate as a function of the optimizer step count (None: linear warmup, then cosine decay to 1 %
 		over total_steps)
 	count_offset: the step count of a restored optimizer state (--carry-opt): the schedule sees count - count_offset
+	arch: architecture options of FundamentalFormPredictor (network.ARCH_DEFAULTS; None: the authors' network)
 
 	Returns: (model, optimizer, train_step) where train_step() is a function that trains the model for a single step.
 	"""
@@ -257,6 +264,7 @@ def FundamentalFormPredictorTrainer(
 		mlp_dim=mlp_dim,
 		dropout_rate=dropout_rate,
 		rngs=rngs,
+		**(arch or {}),
 	)
 
 	# Learning rate schedule
@@ -310,7 +318,10 @@ def FundamentalFormPredictorTrainer(
 		"""
 
 		def loss_fn(model):
-			coefficients = model(positions[neighbors], normals[neighbors])
+			if model.arch['aux_heads']:
+				coefficients, aux = model.predict(positions[neighbors], normals[neighbors])
+			else:
+				coefficients, aux = model(positions[neighbors], normals[neighbors]), None
 
 			loss, loss_dict = SDF_loss(
 				mask,
@@ -322,6 +333,7 @@ def FundamentalFormPredictorTrainer(
 				true_distances,
 				knn_blend=knn_blend,
 				eikonal_weight=eikonal_weight,
+				aux=aux,
 			)
 
 			return loss, loss_dict
@@ -403,13 +415,21 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0, normal_weight=0.0, lipschit
 		batch_mask = jnp.ones(queries.shape[1], bool)
 
 		def loss_fn(model):
-			coefficients = model(UP.reshape(S * U, K, 3), UN.reshape(S * U, K, 3)).reshape(S, U, 6)
+			flat = (UP.reshape(S * U, K, 3), UN.reshape(S * U, K, 3))
+			if model.arch['aux_heads']:
+				coefficients, aux = model.predict(*flat)
+				aux = aux.reshape(S, U, -1)
+			else:
+				coefficients, aux = model(*flat), None
+			coefficients = coefficients.reshape(S, U, 6)
 			_, loss_dict = jax.vmap(
-				lambda m, p, n, c, q, d, ex: SDF_loss(
+				lambda m, p, n, c, q, d, ex, a: SDF_loss(
 					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight,
 					distance_scale=ex.get('dscale'), true_normals=ex.get('qnormals'), lipschitz_from=lipschitz_from,
-				)
-			)(Umask, Upos, Unrm, coefficients, queries, true_distances, extras)
+					aux=a,
+				),
+				in_axes=(0, 0, 0, 0, 0, 0, 0, None if aux is None else 0),
+			)(Umask, Upos, Unrm, coefficients, queries, true_distances, extras, aux)
 			distance_loss = jnp.mean(loss_dict['distance_loss'])
 			eikonality_loss = jnp.mean(loss_dict['eikonality_loss'])
 			loss = distance_loss + eikonal_weight * eikonality_loss
@@ -485,6 +505,9 @@ def TrainFundamentalFormPredictor(
 	resample_decimated=0,
 	resample_analytic='',
 	union_k=0,
+	arch=None,
+	corrupt_flip=0.0,
+	corrupt_outliers=0.0,
 ):
 	"""
 	Args:
@@ -557,6 +580,11 @@ def TrainFundamentalFormPredictor(
 		aux_curv: with mix: add aux_curv * curvature_aux_loss over all union points of the analytic patches (exact
 			principal curvatures of analytic_scene.sample_scene / gen_analytic.py; contact offset a00 = 0 and tilt
 			a01 = a10 = 0 for exact input points and normals) (0: off)
+		corrupt_flip, corrupt_outliers: with multishape: per visit, negate each input normal with probability
+			corrupt_flip, and move each input point off the surface (1-5 sigma, random normal) with probability
+			corrupt_outliers (augment.corrupt; the ground truth stays the mesh; for --aux-heads; 0: off)
+		arch: architecture options of the network (network.ARCH_DEFAULTS; None or {}: the authors' network); saved with
+			the weights, and a warm start (load_model_path) must have the same
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -635,6 +663,7 @@ def TrainFundamentalFormPredictor(
 		eikonal_weight=eikonal_weight,
 		schedule_fn=schedule_fn,
 		count_offset=count_offset,
+		arch=arch,
 	)
 	if saved_opt:
 		nnx.update(optimizer, saved_opt['state'])
@@ -651,6 +680,7 @@ def TrainFundamentalFormPredictor(
 		assert saved_data['n_heads'] == n_heads, 'n_heads mismatch'
 		assert saved_data['n_layers'] == n_layers, 'n_layers mismatch'
 		assert saved_data['mlp_dim'] == mlp_dim, 'mlp_dim mismatch'
+		assert saved_data.get('arch', {}) == (arch or {}), f"architecture options mismatch: {saved_data.get('arch', {})} vs {arch or {}}"
 
 		# Load parameters into model
 		nnx.update(model, saved_data['params'])
@@ -739,6 +769,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError(
 			'band_sigma, min_extent_sigma, dist_sigma, normal_weight and lipschitz_cube need multi-shape patch batches (multishape > 0)'
 		)
+	if (corrupt_flip or corrupt_outliers) and not multishape:
+		raise ValueError('corrupt_flip and corrupt_outliers need multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -784,6 +816,8 @@ def TrainFundamentalFormPredictor(
 			'k_neighbors': k_neighbors,
 			'dropout_rate': dropout_rate,
 		}
+		if arch:
+			saved_data['arch'] = dict(arch)  # architecture options (load_saved_model restores them)
 
 		model_name = f'FundamentalFormPredictor_{epoch}' if save_filepath is None else save_filepath
 		os.makedirs(models_dir, exist_ok=True)
@@ -834,7 +868,10 @@ def TrainFundamentalFormPredictor(
 			)
 
 			# Compute weights for this validation shape
-			val_weights = model(val_pos[val_neigh], val_norm[val_neigh])
+			if model.arch['aux_heads']:
+				val_weights, val_aux = model.predict(val_pos[val_neigh], val_norm[val_neigh])
+			else:
+				val_weights, val_aux = model(val_pos[val_neigh], val_norm[val_neigh]), None
 
 			# Compute loss per batch
 			n_val_batches = (val_pos.shape[0] + batch_size - 1) // batch_size
@@ -858,6 +895,7 @@ def TrainFundamentalFormPredictor(
 						batch_queries,
 						batch_distances,
 						knn_blend=knn_blend,
+						aux=val_aux,
 					)
 					batch_val_losses.append(val_loss)
 					batch_val_eikonality_losses.append(val_eikonality_loss)
@@ -942,6 +980,7 @@ def TrainFundamentalFormPredictor(
 				P, N, NB, M, V, F, FM, tree = augment.visit(
 					arrays, k_neighbors, rng, shape_resample, rotate, noise, quantize, normal_noise, resample_decimated
 				)
+				P, N, NB, M, tree = augment.corrupt(P, N, NB, M, tree, k_neighbors, rng, corrupt_flip, corrupt_outliers)
 				patch = augment.make_patch(
 					P, N, NB, M, tree, k_neighbors, patch_centres, union_size, rng, hole=hole, seed_area=seed_area,
 					union_k=union_k,
@@ -1769,6 +1808,65 @@ def parse_args(argv=None):
 		'--min-points', type=int, default=0, help='drop training shapes with fewer valid points (0: keep all)'
 	)
 	ap.add_argument(
+		'--frame',
+		choices=['legacy', 'continuous', 'invariant'],
+		default='legacy',
+		help="architecture: tangent frame of the network input. legacy: the authors' (jumps at |n_x| = 0.9); continuous: "
+		"Frisvad's frame, continuous except at one direction; invariant: weighted average of the predictions in 3 frames "
+		'attached to the neighbourhood (moments of the tangent offsets), exactly frame- and rotation-invariant and '
+		'continuous, 3x the network cost. The prediction is rotated into the legacy frame, so the torus fits (and the '
+		'C++ inference) are unchanged. Saved with the model',
+	)
+	ap.add_argument(
+		'--input-mlp',
+		action='store_true',
+		help='architecture: encode each neighbour by 13 geometric features (local coordinates and normal, distances, '
+		's^2, st, t^2, secant curvatures from height and normal) through a 2-layer GELU MLP instead of one linear layer '
+		'on the 6 raw ones. Saved with the model',
+	)
+	ap.add_argument(
+		'--encoder',
+		choices=['transformer', 'perceiver'],
+		default='transformer',
+		help="architecture: transformer: the authors' 8 blocks of 64 x 64 self-attention; perceiver: a pointwise MLP on "
+		'the 64 neighbour tokens, --latents learned latent tokens cross-attending to them --cross-layers times, each '
+		'followed by --self-layers latent self-attention blocks, readout = mean of the latents. Saved with the model',
+	)
+	ap.add_argument('--latents', type=int, default=8, help='perceiver: number of latent tokens')
+	ap.add_argument('--cross-layers', type=int, default=2, help='perceiver: number of cross-attention blocks')
+	ap.add_argument('--self-layers', type=int, default=2, help='perceiver: latent self-attention blocks per cross-attention')
+	ap.add_argument(
+		'--wls',
+		action='store_true',
+		help="architecture: the six coefficients are a weighted least-squares jet fit to the neighbours' heights and "
+		'normals, with per-neighbour weights predicted by the network (uniform at initialization), plus a residual '
+		'bounded by --wls-bound (tanh). Saved with the model',
+	)
+	ap.add_argument('--wls-bound', type=float, default=1.0, help='--wls: residual bound (units of the median distance)')
+	ap.add_argument(
+		'--aux-heads',
+		action='store_true',
+		help='architecture: two more outputs per point, a normal-flip logit (the torus SDF is negated where < 0; '
+		'straight-through sign in training) and a confidence logit (log sigmoid added to the point\'s blend exponent). '
+		'Only useful with corrupted inputs (--corrupt-flip, --corrupt-outliers). Saved with the model; infer.py applies '
+		'both heads',
+	)
+	ap.add_argument(
+		'--corrupt-flip',
+		type=float,
+		default=0.0,
+		metavar='P',
+		help='with --multishape: negate each input normal with probability P per visit (isolated flips; for --aux-heads; 0: off)',
+	)
+	ap.add_argument(
+		'--corrupt-outliers',
+		type=float,
+		default=0.0,
+		metavar='P',
+		help='with --multishape: move each input point 1-5 sigma off the surface in a random direction, with a random '
+		'normal, with probability P per visit (for --aux-heads; 0: off)',
+	)
+	ap.add_argument(
 		'--knn-blend',
 		type=int,
 		default=0,
@@ -1831,7 +1929,20 @@ def main(argv=None):
 		resample_decimated=a.resample_decimated,
 		resample_analytic=a.resample_analytic,
 		union_k=a.union_k,
+		arch=arch_options(a),
+		corrupt_flip=a.corrupt_flip,
+		corrupt_outliers=a.corrupt_outliers,
 	)
+
+
+def arch_options(a):
+	"""The architecture options of the command line that differ from the authors' network (network.ARCH_DEFAULTS)."""
+	opts = dict(frame=a.frame, input_mlp=a.input_mlp, encoder=a.encoder, wls=a.wls, aux_heads=a.aux_heads)
+	if a.wls:
+		opts.update(wls_bound=a.wls_bound)
+	if a.encoder == 'perceiver':
+		opts.update(n_latents=a.latents, n_cross=a.cross_layers, n_self=a.self_layers)
+	return {k: v for k, v in opts.items() if v != ARCH_DEFAULTS[k] or k in ('n_latents', 'n_cross', 'n_self', 'wls_bound')}
 
 
 if __name__ == '__main__':

@@ -47,6 +47,7 @@ from flax import nnx
 from scipy.spatial import cKDTree
 
 from pointsastori.network import FundamentalFormPredictor, torus_precompute_masked, torus_distance_gradient_masked
+from pointsastori.network import aux_blend_terms
 import mesh_sampling_jax as MS
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -55,11 +56,14 @@ MESHES = ['block', 'femur', 'knot']
 
 
 # ---------------------------------------------------------------- models
-def load_model(path):
-	"""-> (model in eval mode, k_neighbors). A train.py .pkl, or an .npz of flat Flax paths with a '__config__' entry."""
+def load_model(path, frame=None):
+	"""-> (model in eval mode, k_neighbors). A train.py .pkl, or an .npz of flat Flax paths with a '__config__' entry.
+	frame: None (the model's own) or a frame option (network.FRAMES) to evaluate the same weights in."""
 	if path.endswith('.npz'):
 		z = np.load(path)
 		cfg = json.loads(str(z['__config__']))
+		if frame is not None:
+			cfg['arch'] = {**cfg.get('arch', {}), 'frame': frame}
 		model = FundamentalFormPredictor(
 			embed_dim=cfg['embed_dim'],
 			n_freq=cfg.get('n_freq', 0) or 0,
@@ -68,6 +72,7 @@ def load_model(path):
 			mlp_dim=cfg['mlp_dim'],
 			dropout_rate=0.0,
 			rngs=nnx.Rngs(0),
+			**cfg.get('arch', {}),
 		)
 		state = nnx.state(model, nnx.Param)
 		leaves, treedef = jax.tree_util.tree_flatten_with_path(state)
@@ -80,15 +85,37 @@ def load_model(path):
 		nnx.update(model, jax.tree_util.tree_unflatten(treedef, new))
 		nnx.eval_mode(model)
 		return model, cfg['k_neighbors']
-	return FundamentalFormPredictor.load_saved_model(path)
+	return FundamentalFormPredictor.load_saved_model(path, frame=frame)
+
+
+class CoeffsWithAux(np.ndarray):
+	"""(n, 6) coefficients of an --aux-heads model with its (n, 2) aux logits in .aux (used by field and the loss)."""
 
 
 def coeffs(model, P, N, nbr, chunk=1024):
-	out = []
+	out, aux = [], []
 	for s in range(0, len(nbr), chunk):
 		idx = nbr[s : s + chunk]
-		out.append(np.asarray(model(jnp.asarray(P[idx], jnp.float32), jnp.asarray(N[idx], jnp.float32))))
-	return np.concatenate(out)
+		p, n = jnp.asarray(P[idx], jnp.float32), jnp.asarray(N[idx], jnp.float32)
+		if getattr(model, 'arch', {}).get('aux_heads'):
+			c, a = model.predict(p, n)
+			aux.append(np.asarray(a))
+		else:
+			c = model(p, n)
+		out.append(np.asarray(c))
+	C = np.concatenate(out)
+	if aux:
+		C = C.view(CoeffsWithAux)
+		C.aux = np.concatenate(aux)
+	return C
+
+
+def blend_terms(C):
+	"""(point_sign, log_weight) of torus_distance_gradient_masked for coefficients from coeffs (None, None: no aux)."""
+	aux = getattr(C, 'aux', None)
+	if aux is None:
+		return None, None
+	return aux_blend_terms(jnp.asarray(aux), hard=True)
 
 
 def curvatures(c):
@@ -107,7 +134,8 @@ def field(P, N, C, knn=0):
 	"""Blended SDF (value, gradient) of the tori of cloud P, N with coefficients C."""
 	mask = jnp.ones(len(P), bool)
 	Pj = jnp.asarray(P, jnp.float32)
-	cen, ax, R, r = torus_precompute_masked(mask, Pj, jnp.asarray(N, jnp.float32), jnp.asarray(C, jnp.float32))
+	sign, logw = blend_terms(C)
+	cen, ax, R, r = torus_precompute_masked(mask, Pj, jnp.asarray(N, jnp.float32), jnp.asarray(np.asarray(C), jnp.float32))
 
 	def f(Q, chunk=512):
 		ds, gs = [], []
@@ -115,7 +143,9 @@ def field(P, N, C, knn=0):
 			q = np.zeros((chunk, 3), np.float32)
 			m = min(chunk, len(Q) - s)
 			q[:m] = Q[s : s + m]
-			d, g = torus_distance_gradient_masked(mask, jnp.asarray(q)[None], Pj, cen, ax, R, r, knn=knn)
+			d, g = torus_distance_gradient_masked(
+				mask, jnp.asarray(q)[None], Pj, cen, ax, R, r, knn=knn, point_sign=sign, log_weight=logw
+			)
 			ds.append(np.asarray(d[0])[:m])
 			gs.append(np.asarray(g[0])[:m])
 		return np.concatenate(ds).astype(np.float64), np.concatenate(gs).astype(np.float64)
@@ -424,9 +454,12 @@ def loss_eval(model, k, validation_file):
 			)
 			C = coeffs(model, P, N, nb)
 			mj = jnp.asarray(m)
-			cen, ax, R, r = torus_precompute_masked(mj, jnp.asarray(P), jnp.asarray(N), jnp.asarray(C))
+			sign, logw = blend_terms(C)
+			cen, ax, R, r = torus_precompute_masked(mj, jnp.asarray(P), jnp.asarray(N), jnp.asarray(np.asarray(C)))
 			for s in range(0, len(rows), 128):
-				d, g = torus_distance_gradient_masked(mj, q[s : s + 128], jnp.asarray(P), cen, ax, R, r, knn=knn)
+				d, g = torus_distance_gradient_masked(
+					mj, q[s : s + 128], jnp.asarray(P), cen, ax, R, r, knn=knn, point_sign=sign, log_weight=logw
+				)
 				l1.append(np.abs(np.asarray(d) - np.asarray(D[s : s + 128])).ravel())
 				eik.append(np.abs(1 - np.linalg.norm(np.asarray(g), axis=-1)).ravel())
 		tag = 'all' if knn == 0 else f'knn{knn}'
@@ -459,10 +492,11 @@ def gate_report(res):
 	return lines, ok_all
 
 
-def evaluate(path, label=None, out_dir=None, validation_file=None, loss=True, blend_knn=32):
-	"""blend_knn: the blend of sections 2 and 3 (32: the accelerated inference, the default; 0: all points)."""
+def evaluate(path, label=None, out_dir=None, validation_file=None, loss=True, blend_knn=32, frame=None):
+	"""blend_knn: the blend of sections 2 and 3 (32: the accelerated inference, the default; 0: all points).
+	frame: evaluate the weights in this tangent frame (None: the model's own)."""
 	t0 = time.time()
-	model, k = load_model(path)
+	model, k = load_model(path, frame)
 	label = label or os.path.splitext(os.path.basename(path))[0]
 	res = dict(model=os.path.abspath(path), label=label, blend_knn=blend_knn)
 	res['curv'], res['curv_rows'] = curvature_tracking(model, k)
@@ -509,13 +543,19 @@ def main(argv=None):
 		default=32,
 		help='blend of the field metrics: 32 = the accelerated inference (default); 0 = all points (the numbers of earlier versions)',
 	)
+	ap.add_argument(
+		'--frame',
+		choices=['legacy', 'continuous', 'invariant'],
+		default=None,
+		help="evaluate the weights in this tangent frame (default: the model's own; see train.py --frame)",
+	)
 	a = ap.parse_args(argv)
 	vf = a.validation_file or os.path.join(a.data_dir, 'ABC17_validation_3.npz')
 	print(f"field blend: {'all points' if a.blend_knn == 0 else f'{a.blend_knn} nearest points'}", flush=True)
 	print(HEAD, flush=True)
 	for m in a.models:
 		label, path = m.split('=', 1) if '=' in m else (None, m)
-		r = evaluate(path, label, a.out, vf, loss=not a.no_loss, blend_knn=a.blend_knn)
+		r = evaluate(path, label, a.out, vf, loss=not a.no_loss, blend_knn=a.blend_knn, frame=a.frame)
 		print(row(r), flush=True)
 		if a.gate:
 			for line in gate_report(r)[0]:

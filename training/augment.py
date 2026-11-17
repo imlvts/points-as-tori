@@ -97,6 +97,36 @@ def visit(arrays, k, rng=None, resample='', rotate=False, noise=0.0, quantize=0.
 	return P, N, NB, M, V, F, FM, tree
 
 
+def corrupt(P, N, NB, M, tree, k, rng, flip=0.0, outliers=0.0):
+	"""
+	--corrupt-flip / --corrupt-outliers (for --aux-heads): input corruptions the six Monge coefficients cannot undo.
+	flip: each point's normal is negated with this probability (isolated flips; the ground truth is unchanged).
+	outliers: each point is, with this probability, moved off the surface by U(1, 5) sigma in a uniformly random
+		direction and given a uniformly random normal (sigma: median k-NN distance, estimated on 256 points).
+	Padding is dropped and the k-NN are recomputed when anything is corrupted. Returns (P, N, NB, M, tree) as visit.
+	"""
+	if not (flip or outliers):
+		return P, N, NB, M, tree
+	P, N = P[M].copy(), N[M].copy()
+	n = len(P)
+	M = np.ones(n, bool)
+	if flip:
+		N[rng.uniform(size=n) < flip] *= -1.0
+	if outliers:
+		out = rng.uniform(size=n) < outliers
+		m = int(out.sum())
+		if m:
+			sub = rng.choice(n, min(256, n), replace=False)
+			d, _ = cKDTree(P).query(P[sub], k=min(k, n))
+			sigma = float(np.median(np.median(d, axis=1)))
+			dirs = rng.normal(size=(m, 3))
+			dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+			P[out] += dirs * (rng.uniform(1.0, 5.0, m) * sigma)[:, None]
+			nrm = rng.normal(size=(m, 3))
+			N[out] = nrm / np.linalg.norm(nrm, axis=1, keepdims=True)
+	return P, N, None, M, cKDTree(P)
+
+
 def make_patch(P, N, NB, M, tree, k, n_centres, upad, rng, point_data=None, hole=None, seed_area=False, union_k=0):
 	"""
 	Args:
