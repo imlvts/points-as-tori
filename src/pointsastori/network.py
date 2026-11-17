@@ -1491,20 +1491,20 @@ class FundamentalFormPredictor(nnx.Module):
 		n0 = n0 / jnp.maximum(jnp.linalg.norm(n0, axis=-1, keepdims=True), NAN_EPSILON)
 		s_leg, t_leg = orthonormal_basis_with_rotation(n0, 0.0)
 		if self.arch['frame'] == 'invariant':
-			batch = positions.shape[0]
 			angles, weights = invariant_frames(positions, s_leg, t_leg)  # [batch, F]
-			n_frames = angles.shape[1]
-			co, si = jnp.cos(angles).T.reshape(-1), jnp.sin(angles).T.reshape(-1)  # frame-major [F * batch]
-			s_rep, t_rep = jnp.tile(s_leg, (n_frames, 1, 1)), jnp.tile(t_leg, (n_frames, 1, 1))
-			s_hat = co[:, None, None] * s_rep + si[:, None, None] * t_rep
-			t_hat = -si[:, None, None] * s_rep + co[:, None, None] * t_rep
-			c, aux = self._forward_in_frame(
-				jnp.tile(positions, (n_frames, 1, 1)), jnp.tile(normals, (n_frames, 1, 1)), s_hat, t_hat
-			)
-			c = rotate_coeffs(c, co, si).reshape(n_frames, batch, 6)
-			if aux is not None:
-				aux = jnp.einsum('fb,fbc->bc', weights.T, aux.reshape(n_frames, batch, -1))
-			return jnp.einsum('fb,fbc->bc', weights.T, c), aux
+			# One frame after another, each under remat (rematerialized in the backward pass): training memory about
+			# that of one network pass instead of three, for one more forward pass per frame.
+			forward = nnx.remat(lambda m, p, n, s_, t_: m._forward_in_frame(p, n, s_, t_))
+			c_sum, aux_sum = 0.0, 0.0
+			for f in range(angles.shape[1]):
+				co, si = jnp.cos(angles[:, f]), jnp.sin(angles[:, f])
+				s_hat = co[:, None, None] * s_leg + si[:, None, None] * t_leg
+				t_hat = -si[:, None, None] * s_leg + co[:, None, None] * t_leg
+				c, aux = forward(self, positions, normals, s_hat, t_hat)
+				c_sum = c_sum + weights[:, f, None] * rotate_coeffs(c, co, si)
+				if aux is not None:
+					aux_sum = aux_sum + weights[:, f, None] * aux
+			return c_sum, (aux_sum if self.arch['aux_heads'] else None)
 		if self.arch['frame'] == 'continuous':
 			s_hat, t_hat = continuous_frame(n0)
 		else:
