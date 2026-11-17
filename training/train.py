@@ -477,6 +477,7 @@ def TrainFundamentalFormPredictor(
 	schedule_offset=0,
 	schedule_total=0,
 	carry_opt=False,
+	ema=0.0,
 ):
 	"""
 	Args:
@@ -498,6 +499,10 @@ def TrainFundamentalFormPredictor(
 		carry_opt: save the optimizer state (AdamW moments, step count) next to the final model (<name>_opt.pkl) and,
 			if load_model_path has one, start from it instead of a fresh AdamW (the schedule continues from the phase
 			start; no new warmup with 'wsd')
+		ema: > 0: keep an exponential moving average of the weights (decay min(ema, (1 + n) / (10 + n)) after n updates);
+			the EMA weights are what is validated, saved as the model (<name>.pkl, with 'ema_count') and gated; the raw
+			weights are saved as <name>_raw.pkl. A phase that starts from a model with a _raw.pkl trains the raw weights
+			and continues the EMA from the model's (0: off)
 		clip: clip the gradient to this global norm (0: off)
 		weight_decay: AdamW weight decay
 		eikonal_weight: weight of the eikonality term of the loss (the distance term has weight 1)
@@ -633,6 +638,36 @@ def TrainFundamentalFormPredictor(
 		nnx.update(model, saved_data['params'])
 		print(f'Successfully loaded pretrained weights from {load_model_path}')
 
+	ema_params, ema_count = None, 0
+	if ema:
+		ema_params = jax.tree_util.tree_map(jnp.array, nnx.state(model, nnx.Param))
+		raw_path = os.path.splitext(load_model_path)[0] + '_raw.pkl' if load_model_path not in (None, 'random') else ''
+		if raw_path and os.path.exists(raw_path):
+			ema_count = int(saved_data.get('ema_count', 0))
+			with open(raw_path, 'rb') as f:
+				nnx.update(model, pickle.load(f)['params'])
+			print(f'EMA: training the raw weights of {raw_path}, EMA continued from {load_model_path} ({ema_count} updates)')
+
+	@jax.jit
+	def ema_update(avg, params, decay):
+		return jax.tree_util.tree_map(lambda a, p: decay * a + (1.0 - decay) * p, avg, params)
+
+	def after_update():
+		"""Bookkeeping after every optimizer update (the EMA of --ema)."""
+		nonlocal ema_params, ema_count
+		if ema:
+			ema_count += 1
+			decay = min(ema, (1.0 + ema_count) / (10.0 + ema_count))
+			ema_params = ema_update(ema_params, nnx.state(model, nnx.Param), jnp.float32(decay))
+
+	def eval_net():
+		"""The network that is validated and saved: the EMA weights with --ema, else the model."""
+		if not ema:
+			return model
+		net = nnx.clone(model)
+		nnx.update(net, ema_params)
+		return net
+
 	# Load mesh training data from multiple files.
 	all_training_data = []
 	t0 = time.time()
@@ -713,11 +748,12 @@ def TrainFundamentalFormPredictor(
 	else:
 		print(f'Validation file not found: {val_data_filename}')
 
-	def save_model(curr_model, epoch, save_filepath: str = None):
+	def save_model(curr_model, epoch, save_filepath: str = None, extra=None):
 		# Save weights as pkl file
 		nnx.eval_mode(curr_model)
 		params = nnx.state(curr_model, nnx.Param)
 		saved_data = {
+			**(extra or {}),
 			'params': params,
 			'embed_dim': embed_dim,
 			'n_freq': n_freq,
@@ -736,8 +772,18 @@ def TrainFundamentalFormPredictor(
 
 		print(f'Model saved to {filepath}')
 
-	def run_validation(epoch_key):
-		"""Validation loss (distance, eikonality) of the current model; queries from fold_in(epoch_key, 10000 + i)."""
+	def save_checkpoint(epoch, save_filepath=None):
+		"""save_model of the model; with --ema the EMA weights (with 'ema_count') and the raw ones as <name>_raw."""
+		if not ema:
+			save_model(model, epoch, save_filepath)
+			return
+		name = f'FundamentalFormPredictor_{epoch}' if save_filepath is None else save_filepath
+		save_model(eval_net(), epoch, name, extra={'ema': ema, 'ema_count': ema_count})
+		save_model(model, epoch, name + '_raw')
+
+	def run_validation(epoch_key, model=None):
+		"""Validation loss (distance, eikonality) of the current model (or of model); queries from fold_in(epoch_key, 10000 + i)."""
+		model = eval_net() if model is None else model
 		nnx.eval_mode(model)
 		n_val_shapes = len(val_positions)
 		val_shape_losses = []
@@ -953,6 +999,7 @@ def TrainFundamentalFormPredictor(
 				jnp.stack(distances),
 				extras,
 			)
+			after_update()
 			step += 1
 			extra_terms = [k for k in ('normal_loss', 'aux_loss') if k in loss_dict]
 			log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss'], *(loss_dict[k] for k in extra_terms)))
@@ -973,7 +1020,7 @@ def TrainFundamentalFormPredictor(
 				all_eikonality_losses.append(v[:, 2].mean())
 				log_buffer, union_sizes, t_log = [], [], now
 			if save_every and step % save_every == 0 and step < max_steps:
-				save_model(model, f'step{step}')
+				save_checkpoint(f'step{step}')
 				if val_positions is not None:
 					val_loss, val_eikonality_loss = run_validation(jax.random.fold_in(key, 0))
 					print(f'	{"validation:":<{LABEL_WIDTH}}{val_loss:<{VALUE_WIDTH}.6f}'
@@ -1106,6 +1153,7 @@ def TrainFundamentalFormPredictor(
 				batch_distance_losses_list.append(loss_dict['distance_loss'])
 				batch_eikonality_losses_list.append(loss_dict['eikonality_loss'])
 
+				after_update()
 				step += 1
 				if log_every:
 					log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss']))
@@ -1166,7 +1214,7 @@ def TrainFundamentalFormPredictor(
 			)
 
 			# Save model checkpoint
-			save_model(model, epoch)
+			save_checkpoint(epoch)
 
 			# Validation loss
 			if val_positions is not None:
@@ -1191,7 +1239,7 @@ def TrainFundamentalFormPredictor(
 	eikonality_losses = np.array(all_eikonality_losses)
 
 	# Save final model
-	save_model(model, num_epochs - 1, final_save_filepath)
+	save_checkpoint(num_epochs - 1, final_save_filepath)
 	if carry_opt:
 		opt_path = os.path.join(models_dir, (final_save_filepath or f'FundamentalFormPredictor_{num_epochs - 1}') + '_opt.pkl')
 		with open(opt_path, 'wb') as f:
@@ -1530,6 +1578,14 @@ def parse_args(argv=None):
 		'a phase with a fresh optimizer warms up over --warmup steps)',
 	)
 	ap.add_argument(
+		'--ema',
+		type=float,
+		default=0.0,
+		metavar='DECAY',
+		help='exponential moving average of the weights (e.g. 0.999); the EMA weights are validated, saved as the model and '
+		'gated, the raw weights saved as <model>_raw.pkl (0: off)',
+	)
+	ap.add_argument(
 		'--carry-opt',
 		action='store_true',
 		help='carry the AdamW state (moments, step count) from each phase to the next (saved as <model>_opt.pkl) instead of '
@@ -1699,6 +1755,7 @@ def main(argv=None):
 		aux_curv=a.aux_curv,
 		wsd_decay=a.wsd_decay,
 		carry_opt=a.carry_opt,
+		ema=a.ema,
 	)
 
 
