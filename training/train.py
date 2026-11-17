@@ -92,6 +92,7 @@ def SDF_loss(
 	true_distances,
 	knn_blend=0,
 	eikonal_weight=1.0,
+	distance_scale=None,
 ):
 	"""
 	Compute a loss based on the end-to-end SDF process.
@@ -106,6 +107,7 @@ def SDF_loss(
 		true_distances: (batch_size, n_queries,)
 		knn_blend: blend over the knn_blend nearest points of each query (0: all points; see torus_distance_gradient_masked)
 		eikonal_weight: weight of the eikonality term (the distance term has weight 1)
+		distance_scale: None, or (batch_size,) factors of the distance errors of each row (--dist-sigma: ref / sigma_c)
 	"""
 
 	centers, axes, major_radii, minor_radii = torus_precompute_masked(mask, positions, normals, coefficients)
@@ -117,6 +119,8 @@ def SDF_loss(
 	n_queries_per_neighborhood = queries.shape[1]
 	num_valid = jnp.sum(batch_mask)  # number of valid points in the neighborhood
 	distance_error = jnp.abs((predicted_distances - true_distances))  # (batch_size, n_queries, )
+	if distance_scale is not None:
+		distance_error = distance_error * distance_scale[:, None]
 	distance_valid_mask = ~jnp.isnan(distance_error) & batch_mask[:, None]
 	distance_error_masked = jnp.sum(distance_error * distance_valid_mask, axis=-1)  # (batch_size,)
 	num_valid_distance_queries = jnp.sum(distance_valid_mask)
@@ -322,10 +326,12 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0):
 	Train step on S patches (augment.make_patch), one per shape: the network runs on the patch unions, and SDF_loss is
 	evaluated per patch (tori and blend restricted to the union) on the queries of the patch centres; the loss is the
 	mean over the patches.
+	extras: dict of optional per-patch arrays (the flags of the loss): 'dscale' (S, C) factors of the distance errors
+	of each centre's queries (--dist-sigma).
 	"""
 
 	@nnx.jit
-	def patch_step(model, optimizer, UP, UN, Upos, Unrm, Umask, queries, true_distances):
+	def patch_step(model, optimizer, UP, UN, Upos, Unrm, Umask, queries, true_distances, extras):
 		"""
 		UP, UN: (S, U, k, 3) neighborhoods of the union points; Upos, Unrm: (S, U, 3); Umask: (S, U);
 		queries: (S, C, n_queries, 3); true_distances: (S, C, n_queries)
@@ -336,10 +342,11 @@ def make_patch_step(knn_blend=0, eikonal_weight=1.0):
 		def loss_fn(model):
 			coefficients = model(UP.reshape(S * U, K, 3), UN.reshape(S * U, K, 3)).reshape(S, U, 6)
 			_, loss_dict = jax.vmap(
-				lambda m, p, n, c, q, d: SDF_loss(
-					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight
+				lambda m, p, n, c, q, d, ex: SDF_loss(
+					m, batch_mask, p, n, c, q, d, knn_blend=knn_blend, eikonal_weight=eikonal_weight,
+					distance_scale=ex.get('dscale'),
 				)
-			)(Umask, Upos, Unrm, coefficients, queries, true_distances)
+			)(Umask, Upos, Unrm, coefficients, queries, true_distances, extras)
 			distance_loss = jnp.mean(loss_dict['distance_loss'])
 			eikonality_loss = jnp.mean(loss_dict['eikonality_loss'])
 			loss = distance_loss + eikonal_weight * eikonality_loss
@@ -386,6 +393,7 @@ def TrainFundamentalFormPredictor(
 	mix='',
 	band_sigma=0.0,
 	min_extent_sigma=0.0,
+	dist_sigma=0.0,
 ):
 	"""
 	Args:
@@ -422,6 +430,10 @@ def TrainFundamentalFormPredictor(
 			world units (0: off)
 		min_extent_sigma: with multishape: the minimum extent of a centre's query box is min_extent_sigma * sigma_c
 			instead of 0.1 world units (0: off)
+		dist_sigma: with multishape: the distance error of each query is multiplied by dist_sigma / sigma_c (sigma_c of
+			its centre), i.e. measured in units of the local scale and rescaled by the constant dist_sigma (a typical
+			sigma, so that the loss keeps its size and the eikonality weight and the clipping their meaning; 0: off,
+			world units)
 	"""
 	LABEL_WIDTH = 18  # Width for "distance loss = ", etc.
 	VALUE_WIDTH = 12  # Width for the numeric values
@@ -537,8 +549,8 @@ def TrainFundamentalFormPredictor(
 		raise ValueError('noise and quantize need multi-shape patch batches (multishape > 0)')
 	if mix and not multishape:
 		raise ValueError('mix needs multi-shape patch batches (multishape > 0)')
-	if (band_sigma or min_extent_sigma) and not multishape:
-		raise ValueError('band_sigma and min_extent_sigma need multi-shape patch batches (multishape > 0)')
+	if (band_sigma or min_extent_sigma or dist_sigma) and not multishape:
+		raise ValueError('band_sigma, min_extent_sigma and dist_sigma need multi-shape patch batches (multishape > 0)')
 	print(f'Total shapes across all datasets: {total_shapes}')
 
 	# Load validation data
@@ -765,8 +777,22 @@ def TrainFundamentalFormPredictor(
 				distances.append(d)
 				union_sizes.append(pt[6])
 			stack = lambda i: jnp.asarray(np.stack([pt[i] for pt in patches]))  # noqa: E731
+			extras = {}
+			if dist_sigma:
+				cn = np.stack([pt[5] for pt in patches])  # (S, C, k, 3)
+				sig_c = np.median(np.linalg.norm(cn - cn[:, :, :1], axis=-1), axis=-1)  # (S, C)
+				extras['dscale'] = jnp.asarray(dist_sigma / np.maximum(sig_c, 1e-12), jnp.float32)
 			loss, loss_dict = patch_step(
-				model, optimizer, stack(0), stack(1), stack(2), stack(3), stack(4), jnp.stack(queries), jnp.stack(distances)
+				model,
+				optimizer,
+				stack(0),
+				stack(1),
+				stack(2),
+				stack(3),
+				stack(4),
+				jnp.stack(queries),
+				jnp.stack(distances),
+				extras,
 			)
 			step += 1
 			log_buffer.append((loss, loss_dict['distance_loss'], loss_dict['eikonality_loss']))
@@ -1390,6 +1416,14 @@ def parse_args(argv=None):
 		metavar='M',
 		help='with --multishape: minimum extent of a query box M sigma_c instead of 0.1 world units (0: off)',
 	)
+	ap.add_argument(
+		'--dist-sigma',
+		type=float,
+		default=0.0,
+		metavar='REF',
+		help='with --multishape: distance errors in units of the centre\'s sigma_c, times REF (a typical sigma, e.g. 0.125 for '
+		'--resample 1024:8192; 0: off, world units)',
+	)
 	ap.add_argument('--eik-w', type=float, default=1.0, help='weight of the eikonality term of the loss')
 	ap.add_argument('--clip', type=float, default=0.0, help='clip the gradient to this global norm (0: off)')
 	ap.add_argument('--weight-decay', type=float, default=0.0, help='AdamW weight decay')
@@ -1445,6 +1479,7 @@ def main(argv=None):
 		mix=a.mix,
 		band_sigma=a.band_sigma,
 		min_extent_sigma=a.min_extent_sigma,
+		dist_sigma=a.dist_sigma,
 	)
 
 
